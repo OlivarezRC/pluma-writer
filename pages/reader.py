@@ -59,36 +59,84 @@ with col2:
         ":blue[**Upload Files:**]",
         type=["pdf", "docx", "pptx"],
         accept_multiple_files=True,
-        help="Upload PDF, Word, or PowerPoint files",
+        help="Upload PDF, Word, or PowerPoint files (Max 50MB per file recommended)",
         key="content_upload",
     )
+    
+    # Show file size warning
+    if uploaded_files:
+        total_size = sum(f.size for f in uploaded_files) / (1024 * 1024)  # Convert to MB
+        if total_size > 100:
+            st.warning(f"⚠️ Total file size: {total_size:.1f}MB. Large files may take longer to process.")
+
+# Additional Prompt Instruction (Optional)
+st.session_state.setdefault("additional_instruction_reader", "")
+st.session_state.additional_instruction_reader = st.text_area(
+    ":blue[**Additional Prompt Instruction (Optional):**]",
+    st.session_state.additional_instruction_reader,
+    height=100,
+    key="additional_instruction_reader_input",
+    help="Add any additional instructions to combine with the extracted style...",
+)
+st.caption("This will be appended to the extracted style when saved.")
 
 # Extract text from uploaded files
 extracted_text = ""
 if uploaded_files:
-    for uploaded_file in uploaded_files:
-        file_type = uploaded_file.name.split('.')[-1].lower()
-        # Read the file content once
-        file_content = uploaded_file.read()
-        
-        if file_type == 'pdf':
-            pdf_reader = PdfReader(BytesIO(file_content))
-            for page in pdf_reader.pages:
-                extracted_text += page.extract_text() + "\n"
-                
-        elif file_type == 'docx':
-            doc = Document(BytesIO(file_content))
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    extracted_text += paragraph.text + "\n"
+    progress_bar = st.progress(0, text="Processing uploaded files...")
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        try:
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            # Update progress
+            progress_bar.progress(
+                (idx) / len(uploaded_files),
+                text=f"Processing {uploaded_file.name} ({file_size_mb:.1f}MB)..."
+            )
+            
+            # Read file content once
+            file_content = uploaded_file.read()
+            
+            if not file_content:
+                st.warning(f"⚠️ {uploaded_file.name} is empty or couldn't be read. Skipping.")
+                continue
+            
+            if file_type == 'pdf':
+                pdf_reader = PdfReader(BytesIO(file_content))
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        extracted_text += text + "\n"
                     
-        elif file_type == 'pptx':
-            prs = Presentation(BytesIO(file_content))
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        if shape.text.strip():
+            elif file_type == 'docx':
+                doc = Document(BytesIO(file_content))
+                for paragraph in doc.paragraphs:
+                    if paragraph.text.strip():
+                        extracted_text += paragraph.text + "\n"
+                        
+            elif file_type == 'pptx':
+                prs = Presentation(BytesIO(file_content))
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text.strip():
                             extracted_text += shape.text + "\n"
+            
+            # Clear file content from memory
+            del file_content
+            
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+            continue
+    
+    # Complete progress
+    progress_bar.progress(1.0, text="✓ All files processed!")
+    
+    # Clear progress bar after a moment
+    import time
+    time.sleep(0.5)
+    progress_bar.empty()
 
 
 # ----------------------------
@@ -160,19 +208,38 @@ st.session_state.styleName = st.text_input(
 if st.button(
     ":blue[**Extract Writing Style**]",
     key="extract",
-   # disabled=combined_text.strip() == "" or st.session_state.styleName == "",
     disabled=(
-    combined_text.strip() == ""
-    or st.session_state.styleName == ""
-    #or st.session_state.content == ""
-)
+        combined_text.strip() == ""
+        or st.session_state.styleName == ""
+    ),
 ):
+    with st.spinner("Processing..."):
+        # Check if style name already exists
+        if utils.check_style(st.session_state.styleName):
+            st.session_state["extraction_error"] = f"Style name '{st.session_state.styleName}' already exists. Please choose a different name."
+            st.session_state["extraction_success"] = False
+        else:
+            style = prompts.extract_style(combined_text, False)
+            utils.save_style(style, combined_text)
+            st.session_state["extracted_style"] = style
+            st.session_state["extracted_style_name"] = st.session_state.styleName
+            st.session_state["extraction_success"] = True
+            st.session_state["extraction_error"] = None
+        st.rerun()
+
+# Display extraction results persistently (only once)
+if st.session_state.get("extraction_success"):
     with st.container(border=True):
-        # Extract the writing style
-        with st.spinner("Processing..."):
-            # Check if style name already exists
-            if utils.check_style(st.session_state.styleName):
-                st.error(f"Style name '{st.session_state.styleName}' already exists. Please choose a different name.")
-            else:
-                style = prompts.extract_style(combined_text, False)
-                utils.save_style(style, combined_text)
+        st.success(f"✅ Style '{st.session_state.get('extracted_style_name')}' extracted and saved successfully!")
+        
+        with st.expander("📋 View Extracted Style", expanded=False):
+            st.text_area(
+                "Extracted Writing Style",
+                st.session_state.get("extracted_style", ""),
+                height=300,
+                key="extracted_style_display",
+            )
+
+if st.session_state.get("extraction_error"):
+    with st.container(border=True):
+        st.error(st.session_state["extraction_error"])
