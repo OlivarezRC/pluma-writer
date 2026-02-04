@@ -23,202 +23,129 @@ def _value_to_editor_text(value) -> str:
     return "" if value is None else str(value)
 
 
-def _parse_editor_text(value, original_type):
-    if original_type == "list":
-        return [v.strip() for v in value.splitlines() if v.strip()]
-    if original_type == "dict":
-        return json.loads(value) if value.strip() else {}
-    return value
+with col2:
+    
+    uploaded_files = st.file_uploader(
+        ":blue[**Upload Files:**]",
+        type=["pdf", "docx", "pptx"],
+        accept_multiple_files=True,
+        help="Upload PDF, Word, or PowerPoint files (Max 50MB per file recommended)",
+        key="content_upload",
+    )
+    
+    # Show file size warning
+    if uploaded_files:
+        total_size = sum(f.size for f in uploaded_files) / (1024 * 1024)  # Convert to MB
+        if total_size > 100:
+            st.warning(f"⚠️ Total file size: {total_size:.1f}MB. Large files may take longer to process.")
 
+# Additional Prompt Instruction (Optional)
+st.session_state.setdefault("additional_instruction_reader", "")
+st.session_state.additional_instruction_reader = st.text_area(
+    ":blue[**Additional Prompt Instruction (Optional):**]",
+    st.session_state.additional_instruction_reader,
+    height=100,
+    key="additional_instruction_reader_input",
+    help="Add any additional instructions to combine with the extracted style...",
+)
+st.caption("This will be appended to the extracted style when saved.")
 
-def _coerce_style_schema(doc: dict) -> dict:
-    if not doc:
-        return {}
-    props = doc.get("properties") or {}
-    if isinstance(props, str):
+# Extract text from uploaded files
+extracted_text = ""
+if uploaded_files:
+    progress_bar = st.progress(0, text="Processing uploaded files...")
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
         try:
-            props = json.loads(props)
-        except Exception:
-            props = {}
-    if isinstance(props, dict):
-        nested = props.get("style_instructions") or props.get("style")
-        if isinstance(nested, dict):
-            return nested
-    candidate = doc.get("style_instructions") or doc.get("style")
-    if isinstance(candidate, str):
-        try:
-            candidate = json.loads(candidate)
-        except Exception:
-            candidate = {}
-    if isinstance(candidate, dict):
-        return candidate
-    return {}
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            # Update progress
+            progress_bar.progress(
+                (idx) / len(uploaded_files),
+                text=f"Processing {uploaded_file.name} ({file_size_mb:.1f}MB)..."
+            )
+            
+            # Read file content once
+            file_content = uploaded_file.read()
+            
+            if not file_content:
+                st.warning(f"⚠️ {uploaded_file.name} is empty or couldn't be read. Skipping.")
+                continue
+            
+            if file_type == 'pdf':
+                pdf_reader = PdfReader(BytesIO(file_content))
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        extracted_text += text + "\n"
+                    
+            elif file_type == 'docx':
+                doc = Document(BytesIO(file_content))
+                for paragraph in doc.paragraphs:
+                    if paragraph.text.strip():
+                        extracted_text += paragraph.text + "\n"
+                        
+            elif file_type == 'pptx':
+                prs = Presentation(BytesIO(file_content))
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text.strip():
+                            extracted_text += shape.text + "\n"
+            
+            # Clear file content from memory
+            del file_content
+            
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+            continue
+    
+    # Complete progress
+    progress_bar.progress(1.0, text="✓ All files processed!")
+    
+    # Clear progress bar after a moment
+    import time
+    time.sleep(0.5)
+    progress_bar.empty()
 
 
-def _schema_node_type(node: dict) -> str:
-    if not isinstance(node, dict):
-        return "string"
-    if node.get("type"):
-        return node.get("type")
-    if "properties" in node:
-        return "object"
-    if "items" in node:
-        return "array"
-    return "string"
+# ----------------------------
+# PICK EXACTLY ONE CONTENT SOURCE + PREVIEW
+# ----------------------------
+has_input = bool(st.session_state.content.strip())
+has_uploads = bool(extracted_text.strip())
 
+# Let the user choose if both are present; otherwise auto-pick
+if has_input and has_uploads:
+    source = st.radio(
+        ":blue[**Choose content source**]",
+        ["Uploaded files", "Manual input"],
+        horizontal=True,
+        index=0,
+        help="Use either the text you typed OR the text extracted from the uploaded files."
+    )
+elif has_uploads:
+    source = "Uploaded files"
+elif has_input:
+    source = "Manual input"
+else:
+    source = None
 
-def _schema_value_from_enum(node: dict):
-    node_type = _schema_node_type(node)
-    if node_type == "array":
-        items = node.get("items") or {}
-        return list(items.get("enum") or [])
-    if node_type == "object":
-        return {}
-    return (node.get("enum") or [""])[0]
-
-
-def _state_key(path: list[str]) -> str:
-    return "edit_schema_" + "__".join(path)
-
-
-def _render_schema_fields(node: dict, path: list[str]):
-    node_type = _schema_node_type(node)
-    if node_type == "object":
-        for key, child in (node.get("properties") or {}).items():
-            child_type = _schema_node_type(child)
-            label = _format_section_title(key)
-            if child_type == "object":
-                st.markdown(f"**{label}**")
-                _render_schema_fields(child, path + [key])
-            else:
-                _render_schema_fields(child, path + [key])
-        return
-
-    state_key = _state_key(path)
-    if state_key not in st.session_state:
-        value = _schema_value_from_enum(node)
-        if node_type == "array":
-            st.session_state[state_key] = "\n".join([str(v) for v in value])
-        else:
-            st.session_state[state_key] = "" if value is None else str(value)
-
-    label = _format_section_title(path[-1])
-    if node_type == "array":
-        st.text_area(label, key=state_key, height=140, help="One item per line")
-    elif node_type in ["integer", "number"]:
-        try:
-            current_val = float(st.session_state[state_key])
-        except Exception:
-            current_val = 0.0
-        new_val = st.number_input(label, value=current_val, step=1.0 if node_type == "integer" else 0.1)
-        st.session_state[state_key] = str(int(new_val) if node_type == "integer" else new_val)
-    else:
-        st.text_area(label, key=state_key, height=90)
-
-
-def _update_schema_from_state(node: dict, path: list[str]):
-    node_type = _schema_node_type(node)
-    if node_type == "object":
-        for key, child in (node.get("properties") or {}).items():
-            _update_schema_from_state(child, path + [key])
-        return
-
-    state_key = _state_key(path)
-    raw_value = st.session_state.get(state_key, "")
-    if node_type == "array":
-        items = node.get("items") or {}
-        items["enum"] = [v.strip() for v in str(raw_value).splitlines() if v.strip()]
-        node["items"] = items
-    elif node_type == "integer":
-        try:
-            node["enum"] = [int(float(raw_value))]
-        except Exception:
-            node["enum"] = []
-    elif node_type == "number":
-        try:
-            node["enum"] = [float(raw_value)]
-        except Exception:
-            node["enum"] = []
-    else:
-        node["enum"] = [str(raw_value)] if str(raw_value).strip() != "" else []
-
-
-def _coerce_rulebook_sections(rulebook: dict) -> dict:
-    if not rulebook:
-        return {}
-    for key in ["global_rules", "rules", "rulebook", "rulebook_text"]:
-        if key in rulebook and rulebook[key]:
-            candidate = rulebook[key]
-            if isinstance(candidate, str):
-                try:
-                    candidate = json.loads(candidate)
-                except Exception:
-                    return {key: candidate}
-            if isinstance(candidate, dict):
-                return candidate
-            return {key: candidate}
-    excluded = {
-        "id",
-        "_rid",
-        "_self",
-        "_etag",
-        "_attachments",
-        "_ts",
-        "PartitionKey",
-        "doc_kind",
-        "scope",
-        "version",
-        "created_at",
-        "coverage_metrics",
-    }
-    return {k: v for k, v in rulebook.items() if k not in excluded}
-
-
-def _rulebook_value_type(value) -> str:
-    if isinstance(value, dict):
-        return "dict"
-    if isinstance(value, list):
-        return "list"
-    return "text"
-
-
-def _rulebook_value_to_text(value) -> str:
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    if isinstance(value, list):
-        return "\n".join([str(v) for v in value])
-    return "" if value is None else str(value)
-
-
-def _rulebook_parse_text(value: str, value_type: str):
-    if value_type == "list":
-        return [v.strip() for v in value.splitlines() if v.strip()]
-    if value_type == "dict":
-        return json.loads(value) if value.strip() else {}
-    return value
-
-
-def _extract_rulebook_id(doc: dict):
-    if not doc:
-        return None
-    if doc.get("global_rulebook_id"):
-        return doc.get("global_rulebook_id")
-    props = doc.get("properties") or {}
-    if isinstance(props, dict) and props.get("global_rulebook_id"):
-        gr = props.get("global_rulebook_id")
-        if isinstance(gr, dict):
-            enum_vals = gr.get("enum") or []
-            return enum_vals[0] if enum_vals else None
-        return gr
-    return None
-
-
-pages.show_home()
-pages.show_sidebar()
-
-st.header("✏️Style Editor")
-
-st.markdown(
+# Decide combined_text and show a preview when using uploads
+if source == "Uploaded files":
+    combined_text = extracted_text  # keep full unicode; your PDF builder handles fonts
+    with st.expander("📄 Preview: Extracted text from uploaded files", expanded=True):
+        st.text_area(
+            "Extracted Text",
+            combined_text,
+            height=240,
+            key="uploaded_text_preview",
+        )
+elif source == "Manual input":
+    combined_text = st.session_state.content
+else:
+    combined_text = ""
+    st.markdown(
     """
     <style>
     .stButton{width:100%;}
@@ -280,181 +207,41 @@ st.session_state.setdefault("editor_selected_speaker", None)
 st.session_state.setdefault("editor_selected_audience", None)
 st.session_state.setdefault("selected_global_rulebook_id", None)
 
-st.subheader("Select Speaker")
-speaker_cols = st.columns(2)
-for idx, speaker in enumerate(sorted(speaker_map.keys())):
-    with speaker_cols[idx % 2]:
-        is_selected = st.session_state.editor_selected_speaker == speaker
-        with st.expander(speaker, expanded=is_selected):
-            audiences = sorted(speaker_map[speaker].keys())
-            audience_cols = st.columns(2)
-            for a_idx, audience in enumerate(audiences):
-                with audience_cols[a_idx % 2]:
-                    if st.button(audience, key=f"aud_{speaker}_{audience}", use_container_width=True):
-                        st.session_state.editor_selected_speaker = speaker
-                        st.session_state.editor_selected_audience = audience
-
-selected_speaker = st.session_state.editor_selected_speaker
-selected_audience = st.session_state.editor_selected_audience
-if selected_speaker and selected_audience:
-    selected_doc = utils.get_style_fingerprint(selected_speaker, selected_audience) or speaker_map[selected_speaker][selected_audience]
-    doc_id = selected_doc.get("id") or selected_doc.get("container_key") or selected_doc.get("name")
-
-    header_col, spacer_col, action_col = st.columns([3, 0.4, 0.9])
-    with header_col:
-        audience_label = _format_section_title(selected_audience)
-        st.subheader("Style Settings")
-        st.markdown(
-            f"<div style='color:#6b7280;font-size:0.9rem;margin-top:-0.5rem;margin-bottom:0.75rem;'>"
-            f"{selected_speaker} / {audience_label}"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    with spacer_col:
-        st.write("")
-    with action_col:
-        save_clicked = st.button("💾 Save Style", key="save_style")
-    style_schema = _coerce_style_schema(selected_doc)
-    if not isinstance(style_schema, dict) or not style_schema:
-        st.warning("This style has no editable style schema.")
-        st.stop()
-
-    schema_properties = style_schema.get("properties") if isinstance(style_schema, dict) else {}
-    has_schema_sections = isinstance(schema_properties, dict) and bool(schema_properties)
-
-    value_sections = {}
-    value_section_types = {}
-
-    if has_schema_sections:
-        for section, section_schema in schema_properties.items():
-            section_title = _format_section_title(section)
-            with st.expander(section_title, expanded=False):
-                _render_schema_fields(section_schema, [doc_id, section])
-    elif isinstance(style_schema, dict) and style_schema:
-        value_sections = style_schema
-        for section, value in value_sections.items():
-            if isinstance(value, dict):
-                value_section_types[section] = "dict"
-            elif isinstance(value, list):
-                value_section_types[section] = "list"
-            else:
-                value_section_types[section] = "text"
-
-            section_key = f"edit_{doc_id}_{section}"
-            if section_key not in st.session_state:
-                st.session_state[section_key] = _value_to_editor_text(value)
-
-            section_title = _format_section_title(section)
-            with st.expander(section_title, expanded=False):
-                st.text_area(
-                    section_title,
-                    key=section_key,
-                    height=160 if value_section_types[section] != "text" else 120,
-                    help="Use one item per line for lists; use JSON for objects.",
-                )
-    else:
-        st.warning("This style has no editable sections.")
-        st.stop()
-
-
-    if save_clicked:
-        new_doc = dict(selected_doc)
-        if has_schema_sections:
-            new_schema = json.loads(json.dumps(style_schema))
-            for section, section_schema in (new_schema.get("properties") or {}).items():
-                _update_schema_from_state(section_schema, [doc_id, section])
-
-            if "properties" in new_doc and isinstance(new_doc["properties"], dict):
-                if "style_instructions" in new_doc["properties"]:
-                    new_doc["properties"]["style_instructions"] = new_schema
-                elif "style" in new_doc["properties"]:
-                    new_doc["properties"]["style"] = new_schema
-            else:
-                new_doc["style_instructions"] = new_schema
+if st.button(
+    ":blue[**Extract Writing Style**]",
+    key="extract",
+    disabled=(
+        combined_text.strip() == ""
+        or st.session_state.styleName == ""
+    ),
+):
+    with st.spinner("Processing..."):
+        # Check if style name already exists
+        if utils.check_style(st.session_state.styleName):
+            st.session_state["extraction_error"] = f"Style name '{st.session_state.styleName}' already exists. Please choose a different name."
+            st.session_state["extraction_success"] = False
         else:
-            updated = {}
-            for section, section_type in value_section_types.items():
-                section_key = f"edit_{doc_id}_{section}"
-                raw_value = st.session_state.get(section_key, "")
-                updated[section] = _parse_editor_text(raw_value, section_type)
-            new_doc["style_instructions"] = updated
+            style = prompts.extract_style(combined_text, False)
+            utils.save_style(style, combined_text)
+            st.session_state["extracted_style"] = style
+            st.session_state["extracted_style_name"] = st.session_state.styleName
+            st.session_state["extraction_success"] = True
+            st.session_state["extraction_error"] = None
+        st.rerun()
 
-        style_saved = utils.save_style_fingerprint(new_doc)
+# Display extraction results persistently (only once)
+if st.session_state.get("extraction_success"):
+    with st.container(border=True):
+        st.success(f"✅ Style '{st.session_state.get('extracted_style_name')}' extracted and saved successfully!")
+        
+        with st.expander("📋 View Extracted Style", expanded=False):
+            st.text_area(
+                "Extracted Writing Style",
+                st.session_state.get("extracted_style", ""),
+                height=300,
+                key="extracted_style_display",
+            )
 
-        if style_saved:
-            st.success("Style updated and saved.")
-
-# --- Global Settings (always visible) ---
-selected_rulebook_id = st.session_state.selected_global_rulebook_id
-if not selected_rulebook_id and selected_speaker and selected_audience:
-    selected_rulebook_id = _extract_rulebook_id(selected_doc)
-
-available_rulebook_ids = sorted(global_rulebooks.keys())
-if available_rulebook_ids:
-    if selected_rulebook_id not in available_rulebook_ids:
-        selected_rulebook_id = available_rulebook_ids[0]
-    selected_rulebook_id = st.selectbox(
-        "Global Rulebook",
-        options=available_rulebook_ids,
-        index=available_rulebook_ids.index(selected_rulebook_id),
-    )
-    st.session_state.selected_global_rulebook_id = selected_rulebook_id
-
-    rulebook = utils.get_rulebook(selected_rulebook_id)
-    rulebook_sections = _coerce_rulebook_sections(rulebook)
-
-    header_col, spacer_col, action_col = st.columns([3, 0.4, 0.9])
-    with header_col:
-        st.subheader("Global Settings")
-        st.caption(f"Rulebook: {selected_rulebook_id}")
-    with spacer_col:
-        st.write("")
-    with action_col:
-        save_global_clicked = st.button("💾 Save Global", key="save_global")
-
-    if rulebook_sections:
-        for section, value in rulebook_sections.items():
-            value_type = _rulebook_value_type(value)
-            state_key = f"global_{selected_rulebook_id}_{section}"
-            if state_key not in st.session_state:
-                st.session_state[state_key] = _rulebook_value_to_text(value)
-            section_title = _format_section_title(section)
-            with st.expander(section_title, expanded=False):
-                st.text_area(
-                    section_title,
-                    key=state_key,
-                    height=160 if value_type != "text" else 120,
-                    help="Use one item per line for lists; use JSON for objects.",
-                )
-    else:
-        st.info("No global settings found for this rulebook.")
-
-    if save_global_clicked and rulebook:
-        updated_sections = {}
-        rulebook_saved = True
-        for section, value in rulebook_sections.items():
-            state_key = f"global_{selected_rulebook_id}_{section}"
-            raw_value = st.session_state.get(state_key, "")
-            try:
-                updated_sections[section] = _rulebook_parse_text(
-                    raw_value, _rulebook_value_type(value)
-                )
-            except Exception as exc:
-                st.error(f"Global Settings: {section} - {exc}")
-                rulebook_saved = False
-
-        if rulebook_saved:
-            new_rulebook = dict(rulebook)
-            target_key = None
-            for key in ["global_rules", "rules", "rulebook", "rulebook_text"]:
-                if key in new_rulebook:
-                    target_key = key
-                    break
-            if not target_key:
-                target_key = "global_rules"
-            new_rulebook[target_key] = updated_sections
-            if utils.save_style_fingerprint(new_rulebook):
-                st.success("Global settings saved.")
-else:
-    st.subheader("Global Settings")
-    st.info("No global rulebooks found.")
+if st.session_state.get("extraction_error"):
+    with st.container(border=True):
+        st.error(st.session_state["extraction_error"])

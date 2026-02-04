@@ -124,34 +124,84 @@ with col2:
         ":blue[**Upload Files:**]",
         type=["pdf", "docx", "pptx"],
         accept_multiple_files=True,
-        help="Upload PDF, Word, or PowerPoint files",
+        help="Upload PDF, Word, or PowerPoint files (Max 50MB per file recommended)",
         key="content_upload",
     )
+    
+    # Show file size warning
+    if uploaded_files:
+        total_size = sum(f.size for f in uploaded_files) / (1024 * 1024)  # Convert to MB
+        if total_size > 100:
+            st.warning(f"⚠️ Total file size: {total_size:.1f}MB. Large files may take longer to process.")
+
+# Additional Prompt Instruction (Optional)
+st.session_state.setdefault("additional_instruction", "")
+st.session_state.additional_instruction = st.text_area(
+    ":blue[**Additional Prompt Instruction (Optional):**]",
+    st.session_state.additional_instruction,
+    height=100,
+    key="additional_instruction_input",
+    help="Add any specific instructions for rewriting...",
+)
+st.caption("This will be added to the prompt sent to the AI for rewriting.")
 
 # Extract text from uploaded files
 extracted_text = ""
 if uploaded_files:
-    for uploaded_file in uploaded_files:
-        file_type = uploaded_file.name.split('.')[-1].lower()
-        
-        if file_type == 'pdf':
-            pdf_reader = PdfReader(BytesIO(uploaded_file.read()))
-            for page in pdf_reader.pages:
-                extracted_text += page.extract_text() + "\n"
-                
-        elif file_type == 'docx':
-            doc = Document(BytesIO(uploaded_file.read()))
-            for paragraph in doc.paragraphs:
-                if paragraph.text.strip():
-                    extracted_text += paragraph.text + "\n"
+    progress_bar = st.progress(0, text="Processing uploaded files...")
+    
+    for idx, uploaded_file in enumerate(uploaded_files):
+        try:
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            # Update progress
+            progress_bar.progress(
+                (idx) / len(uploaded_files),
+                text=f"Processing {uploaded_file.name} ({file_size_mb:.1f}MB)..."
+            )
+            
+            # Read file content once
+            file_content = uploaded_file.read()
+            
+            if not file_content:
+                st.warning(f"⚠️ {uploaded_file.name} is empty or couldn't be read. Skipping.")
+                continue
+            
+            if file_type == 'pdf':
+                pdf_reader = PdfReader(BytesIO(file_content))
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        extracted_text += text + "\n"
                     
-        elif file_type == 'pptx':
-            prs = Presentation(BytesIO(uploaded_file.read()))
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        if shape.text.strip():
+            elif file_type == 'docx':
+                doc = Document(BytesIO(file_content))
+                for paragraph in doc.paragraphs:
+                    if paragraph.text.strip():
+                        extracted_text += paragraph.text + "\n"
+                        
+            elif file_type == 'pptx':
+                prs = Presentation(BytesIO(file_content))
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text.strip():
                             extracted_text += shape.text + "\n"
+            
+            # Clear file content from memory
+            del file_content
+            
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+            continue
+    
+    # Complete progress
+    progress_bar.progress(1.0, text="✓ All files processed!")
+    
+    # Clear progress bar after a moment
+    import time
+    time.sleep(0.5)
+    progress_bar.empty()
 
 
 # ----------------------------
@@ -564,7 +614,8 @@ st.write(":blue[**Select Editorial Style Guides:**]")
 
 # Tooltip for guideline summary in the UI
 def render_guideline_checkbox(section_name: str, content: str, col_key_prefix: str):
-    default_checked = section_name in ["COMMON GRAMMATICAL ERRORS", "WRITING LETTERS"]
+    default_checked = section_name in ["ACRONYMS AND ABBREVIATIONS","CAPITALIZATION","NUMBERS","PUNCTUATION","SPECIAL CHARACTERS","COMMON GRAMMATICAL ERRORS", "LATIN ABBREVIATIONS","DOCUMENT SPECIFICATIONS","WRITING LETTERS",
+    "Common acronyms and abbreviations"]
     tooltip = guidelines_summary.get(section_name, None)  # one-sentence summary for hover
     if st.checkbox(
         section_name,
@@ -612,17 +663,483 @@ st.session_state.guidelines = "\n".join(selected_guidelines)
 # --- NEW helpers: make DOCX/PDF from text ---
 
 def make_docx_bytes(text: str, title: str | None = None) -> bytes:
-    """Return a .docx file (bytes) with a title and body paragraphs."""
+    """Return a .docx file (bytes) following UKB 04 format structure."""
+    from docx.shared import Pt, Inches, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+    import re as regex_module
+    
     doc = Document()
-    if title:
-        doc.add_heading(title, level=1)
-    # Split into paragraphs on blank lines while preserving line breaks
-    for block in text.replace("\r\n", "\n").split("\n\n"):
+    
+    # Set default font and margins
+    sections = doc.sections
+    for section in sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1.25)
+        section.right_margin = Inches(1.25)
+    
+    # Helper function to set cell shading
+    def set_cell_shading(cell, color_hex):
+        """Set cell background color"""
+        shading_elm = OxmlElement('w:shd')
+        shading_elm.set(qn('w:fill'), color_hex)
+        cell._element.get_or_add_tcPr().append(shading_elm)
+    
+    # Helper function to set cell borders
+    def set_cell_border(cell, **kwargs):
+        """Set cell borders"""
+        tc = cell._element
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = OxmlElement('w:tcBorders')
+        for edge in ('top', 'left', 'bottom', 'right'):
+            if edge in kwargs:
+                edge_elem = OxmlElement(f'w:{edge}')
+                edge_elem.set(qn('w:val'), 'single')
+                edge_elem.set(qn('w:sz'), '4')
+                edge_elem.set(qn('w:color'), kwargs[edge])
+                tcBorders.append(edge_elem)
+        tcPr.append(tcBorders)
+    
+    # === COVER PAGE ===
+    # Add BSP Logo if available
+    logo_path = "img/bsp-logo.png"
+    if os.path.exists(logo_path):
         p = doc.add_paragraph()
-        for line in block.split("\n"):
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run()
+        run.add_picture(logo_path, width=Inches(1.5))
+    
+    doc.add_paragraph()
+    
+    # BANGKO SENTRAL NG PILIPINAS
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("BANGKO SENTRAL NG PILIPINAS")
+    run.font.size = Pt(16)
+    run.font.bold = True
+    
+    doc.add_paragraph()
+    
+    # FINANCIAL SUPERVISION SECTOR
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("FINANCIAL SUPERVISION SECTOR")
+    run.font.size = Pt(12)
+    run.font.bold = True
+    
+    # Add spacing
+    for _ in range(3):
+        doc.add_paragraph()
+    
+    # Main Title with box
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("REPORT OF EXAMINATION")
+    run.font.size = Pt(16)
+    run.font.bold = True
+    
+    # Add spacing
+    for _ in range(2):
+        doc.add_paragraph()
+    
+    # Style/Document Name
+    if title:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(title)
+        run.font.size = Pt(14)
+        run.font.bold = True
+    
+    doc.add_paragraph()
+    
+    # Location
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("Philippines")
+    run.font.size = Pt(11)
+    
+    # Add spacing
+    for _ in range(2):
+        doc.add_paragraph()
+    
+    # Document Type
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("Style Rewrite")
+    run.font.size = Pt(11)
+    
+    # Add spacing
+    for _ in range(3):
+        doc.add_paragraph()
+    
+    # Date
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    date_str = datetime.now().strftime("%d %B %Y")
+    run = p.add_run(f"Date Generated: {date_str}")
+    run.font.size = Pt(11)
+    
+    # Page break
+    doc.add_page_break()
+    
+    # === CONFIDENTIALITY NOTICE PAGE ===
+    # Add logo and header
+    if os.path.exists(logo_path):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run()
+        run.add_picture(logo_path, width=Inches(1.2))
+    
+    doc.add_paragraph()
+    
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("FINANCIAL SUPERVISION SECTOR")
+    run.font.size = Pt(10)
+    run.font.bold = True
+    
+    for _ in range(2):
+        doc.add_paragraph()
+    
+    # Report Title
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("REPORT OF EXAMINATION")
+    run.font.size = Pt(14)
+    run.font.bold = True
+    
+    doc.add_paragraph()
+    
+    # Confidentiality Notice
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("THIS REPORT IS STRICTLY CONFIDENTIAL")
+    run.font.size = Pt(12)
+    run.font.bold = True
+    
+    doc.add_paragraph()
+    
+    notice = doc.add_paragraph()
+    notice.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    notice_text = ("This report was generated by Bangko Sentral ng Pilipinas (BSP) Style Writer application. "
+                   "The content has been rewritten according to the selected editorial style guidelines. "
+                   "This document is provided for internal use and review purposes. "
+                   "Under no circumstance should this document or any portion thereof be disclosed or made public in any manner, "
+                   "except when allowed by law, regulations, or judicial orders. "
+                   "Please verify the content for accuracy and compliance before official distribution.")
+    run = notice.add_run(notice_text)
+    run.font.size = Pt(10)
+    
+    # Page break
+    doc.add_page_break()
+    
+    # === TABLE OF CONTENTS ===
+    doc.add_heading("TABLE OF CONTENTS", level=1)
+    doc.add_paragraph()
+    
+    # TOC entries
+    toc_items = [
+        ("List of Acronyms", "i"),
+        ("Content", "1"),
+    ]
+    
+    for item, page in toc_items:
+        p = doc.add_paragraph()
+        p.add_run(item).font.size = Pt(11)
+        p.add_run("\t").font.size = Pt(11)
+        p.add_run(page).font.size = Pt(11)
+    
+    # Page break
+    doc.add_page_break()
+    
+    # === LIST OF ACRONYMS ===
+    doc.add_heading("LIST OF ACRONYMS", level=1)
+    doc.add_paragraph()
+    
+    # Comprehensive list of BSP acronyms
+    acronyms = {
+        "AC": "Audit Committee",
+        "ALCO": "Asset and Liability Committee",
+        "ALM": "Asset-Liability Management",
+        "AML": "Anti-Money Laundering",
+        "AP": "Associated Person",
+        "ARA": "Actual Risk Assessment",
+        "B2C": "Business-to-Consumer",
+        "BAU": "Business-as-Usual",
+        "BBS": "Branch Banking Services",
+        "BOD": "Board of Directors",
+        "BSP": "Bangko Sentral ng Pilipinas",
+        "BT": "Bancassurance",
+        "CAMEL": "Capital, Assets, Management, Earnings, Liquidity",
+        "CASA": "Current and Savings Account",
+        "CBS": "Core Banking System",
+        "CDD": "Customer Due Diligence",
+        "CEO": "Chief Executive Officer",
+        "CET": "Common Equity Tier",
+        "CFO": "Chief Financial Officer",
+        "CIMFS": "Customer Incident Management and Feedback System",
+        "CLO": "Chief Lending Officer",
+        "CMDI": "Capital Market Development Initiatives",
+        "COPC": "Certified Unit Selling Personnel",
+        "CORACTS": "Guidelines on Transaction Reporting and Compliance",
+        "CRO": "Chief Risk Officer",
+        "CTF": "Counter-Terrorism Financing",
+        "DCF": "Discounted Cash Flow",
+        "DOT": "Declaration of Trust",
+        "DST": "Documentary Stamp Tax",
+        "EaR": "Earnings at Risk",
+        "ECAI": "External Credit Assessment Institution",
+        "ECL": "Expected Credit Loss",
+        "ECOMM": "E-Commerce",
+        "ERM": "Enterprise Risk Management",
+        "FMS": "Financial Markets Sector",
+        "FOE": "Foreign-Owned Entity",
+        "FSS": "Financial Supervision Sector",
+        "FVOCI": "Fair Value through Other Comprehensive Income",
+        "FVPL": "Fair Value through Profit or Loss",
+        "GCG": "Good Corporate Governance",
+        "HO": "Head Office",
+        "HRMG": "Human Resource Management Group",
+        "IAS": "International Accounting Standards",
+        "IAASB": "Internal Audit and Regulatory Assessment Process",
+        "ICAAP": "Internal Capital Adequacy Assessment Process",
+        "IFRS": "International Financial Reporting Standards",
+        "IMA": "Investment Management Account",
+        "IRRBB": "Interest Rate Risk in the Banking Book",
+        "KRI": "Key Risk Indicator",
+        "LCR": "Liquidity Coverage Ratio",
+        "LGD": "Loss Given Default",
+        "LTV": "Loan-to-Value",
+        "MIS": "Management Information System",
+        "MORB": "Manual of Regulations for Banks",
+        "MORNBFI": "Manual of Regulations for Non-Bank Financial Institutions",
+        "NII": "Net Interest Income",
+        "NIM": "Net Interest Margin",
+        "NPL": "Non-Performing Loan",
+        "NSFR": "Net Stable Funding Ratio",
+        "ORM": "Operational Risk Management",
+        "PD": "Probability of Default",
+        "PFRS": "Philippine Financial Reporting Standards",
+        "RA": "Risk Assessment",
+        "RCSA": "Risk and Control Self-Assessment",
+        "ROA": "Return on Assets",
+        "ROE": "Return on Equity",
+        "RP": "Risk Profile",
+        "RPT": "Related Party Transaction",
+        "RWA": "Risk-Weighted Assets",
+        "SME": "Small and Medium Enterprise",
+        "TBA": "Treasury Bills Auction",
+        "VaR": "Value at Risk",
+        "BSFI": "BSP-Supervised Financial Institution",
+    }
+    
+    # Create table for acronyms
+    table = doc.add_table(rows=len(acronyms) + 1, cols=2)
+    table.style = 'Light Grid Accent 1'
+    
+    # Header row
+    header_cells = table.rows[0].cells
+    header_cells[0].text = "Acronym"
+    header_cells[1].text = "Definition"
+    for cell in header_cells:
+        for paragraph in cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.bold = True
+                run.font.size = Pt(11)
+    
+    # Data rows
+    for idx, (acronym, definition) in enumerate(acronyms.items(), 1):
+        row_cells = table.rows[idx].cells
+        row_cells[0].text = acronym
+        row_cells[1].text = definition
+        for cell in row_cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(10)
+    
+    # Page break
+    doc.add_page_break()
+    
+    # === MAIN CONTENT ===
+    doc.add_heading("CONTENT", level=1)
+    doc.add_paragraph()
+    
+    # Helper function to detect table-like content
+    def is_table_content(lines):
+        """Detect if lines represent a table structure"""
+        if len(lines) < 2:
+            return False
+        non_empty = [line for line in lines if line.strip()]
+        if len(non_empty) < 2:
+            return False
+        # Check for multiple columns indicated by tabs or multiple spaces
+        tab_counts = [line.count('\t') for line in non_empty]
+        space_pattern = [len(regex_module.findall(r'\s{2,}', line)) for line in non_empty]
+        # At least 2 lines must have consistent column separators
+        has_tabs = sum(1 for c in tab_counts if c > 0) >= 2
+        has_spaces = sum(1 for s in space_pattern if s >= 2) >= 2
+        return has_tabs or has_spaces
+    
+    # Helper function to create formatted table
+    def create_assessment_table(lines):
+        """Create a formatted BSP assessment table from lines"""
+        # Parse table structure
+        table_data = []
+        for line in lines:
             if line.strip():
-                p.add_run(line)
-            p.add_run("\n")
+                # Split by tab or multiple spaces (2 or more)
+                if '\t' in line:
+                    cells = [cell.strip() for cell in line.split('\t') if cell.strip()]
+                else:
+                    # Split by 2+ spaces, filter empty cells
+                    cells = [cell.strip() for cell in regex_module.split(r'\s{2,}', line) if cell.strip()]
+                if cells:
+                    table_data.append(cells)
+        
+        if not table_data or len(table_data) < 2:
+            return None
+        
+        # Determine number of columns (use most common column count)
+        col_counts = [len(row) for row in table_data]
+        max_cols = max(col_counts)
+        if max_cols == 0 or max_cols == 1:
+            return None
+        
+        # Normalize rows to have consistent column count
+        for row in table_data:
+            while len(row) < max_cols:
+                row.append('')
+        
+        # Create table with proper styling
+        table = doc.add_table(rows=len(table_data), cols=max_cols)
+        table.style = 'Light Grid Accent 1'
+        table.alignment = WD_TABLE_ALIGNMENT.LEFT
+        
+        # Set column widths based on content
+        if max_cols == 2:
+            table.columns[0].width = Inches(4.0)
+            table.columns[1].width = Inches(1.5)
+        elif max_cols == 3:
+            table.columns[0].width = Inches(2.5)
+            table.columns[1].width = Inches(2.0)
+            table.columns[2].width = Inches(1.5)
+        elif max_cols == 4:
+            table.columns[0].width = Inches(2.0)
+            table.columns[1].width = Inches(2.0)
+            table.columns[2].width = Inches(1.0)
+            table.columns[3].width = Inches(1.5)
+        elif max_cols >= 5:
+            for col_idx in range(max_cols):
+                table.columns[col_idx].width = Inches(6.0 / max_cols)
+        
+        # Fill table with data and formatting
+        for i, row_data in enumerate(table_data):
+            row_cells = table.rows[i].cells
+            for j, cell_text in enumerate(row_data):
+                cell = row_cells[j]
+                # Clear default paragraph
+                cell.text = ''
+                p = cell.paragraphs[0]
+                run = p.add_run(cell_text)
+                
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                
+                # Format first row as header
+                if i == 0:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    run.font.bold = True
+                    run.font.size = Pt(10)
+                    run.font.name = 'Calibri'
+                    # Add gray shading to header
+                    set_cell_shading(cell, 'D9D9D9')
+                else:
+                    # Regular cell formatting
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    run.font.size = Pt(10)
+                    run.font.name = 'Calibri'
+                    
+                    # Highlight ratings/assessment values
+                    if any(keyword in cell_text.upper() for keyword in ['STRONG', 'MODERATE', 'LOW', 'ACCEPTABLE', 'WEAK', 'HIGH']):
+                        run.font.bold = True
+                
+                # Remove extra spacing in paragraphs
+                p.space_before = Pt(0)
+                p.space_after = Pt(0)
+        
+        return table
+    
+    # Process content blocks with enhanced formatting
+    current_section = None
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        if block.strip():
+            stripped_block = block.strip()
+            lines = stripped_block.split('\n')
+            
+            # Check if this is a table structure
+            if is_table_content(lines):
+                table = create_assessment_table(lines)
+                if table:
+                    continue
+            
+            # Detect major section headers
+            is_major_header = False
+            is_minor_header = False
+            
+            # Major headers: Roman numerals or risk assessment titles
+            if (regex_module.match(r'^(I{1,3}V?|IV|V|VI{0,3}|IX|X{1,3}|XL|L|LX{0,3}|XC|C{1,3})\.\s+', stripped_block) or
+                regex_module.match(r'^(Assessment|Directives|Overall|Summary|Scope|Conclusion):', stripped_block, regex_module.IGNORECASE)):
+                is_major_header = True
+                current_section = stripped_block
+            
+            # Minor headers: Numbers or labeled items
+            elif (regex_module.match(r'^\d+[\.\)]\s+', stripped_block) or
+                  (len(lines[0]) < 100 and lines[0].isupper())):
+                is_minor_header = True
+            
+            # Create paragraph with appropriate styling
+            if is_major_header:
+                # Major section header - larger, bold, with spacing
+                p = doc.add_paragraph()
+                p.space_before = Pt(12)
+                p.space_after = Pt(6)
+                run = p.add_run(stripped_block)
+                run.font.size = Pt(12)
+                run.font.bold = True
+                run.font.name = 'Calibri'
+            elif is_minor_header:
+                # Minor section header - bold, normal size
+                p = doc.add_paragraph()
+                p.space_before = Pt(6)
+                p.space_after = Pt(3)
+                run = p.add_run(stripped_block)
+                run.font.size = Pt(11)
+                run.font.bold = True
+                run.font.name = 'Calibri'
+            else:
+                # Regular content paragraph
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                
+                # Handle multi-line content
+                for i, line in enumerate(lines):
+                    if line.strip():
+                        # Check if line itself is a header
+                        line_is_header = (len(line.strip()) < 100 and line.strip().isupper())
+                        
+                        run = p.add_run(line.strip())
+                        run.font.size = Pt(11)
+                        run.font.name = 'Calibri'
+                        
+                        if line_is_header:
+                            run.font.bold = True
+                        
+                        # Add line break if not last line
+                        if i < len(lines) - 1:
+                            p.add_run('\n')
+    
     bio = BytesIO()
     doc.save(bio)
     return bio.getvalue()
@@ -642,95 +1159,455 @@ def _register_pdf_font_if_available():
 
 
 def make_pdf_bytes(text: str, title: str | None = None) -> bytes:
-    """Return a PDF (bytes) using ReportLab."""
+    """Return a PDF (bytes) following UKB 04 format structure using ReportLab."""
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+    from reportlab.platypus import PageBreak, Table, TableStyle, Image
+    from reportlab.lib import colors
+    import re as regex_module
+    
     font_name = _register_pdf_font_if_available()
+
+    # Custom page template with header and logo
+    def add_page_header(canvas, doc):
+        """Add BSP logo and header to each page except cover"""
+        canvas.saveState()
+        logo_path = "img/bsp-logo.png"
+        if os.path.exists(logo_path) and doc.page > 1:
+            # Add small logo at top
+            canvas.drawImage(logo_path, 2.5*cm, A4[1] - 1.5*cm, width=1.5*cm, height=1.5*cm, preserveAspectRatio=True, mask='auto')
+            # Add text next to logo
+            canvas.setFont(font_name, 8)
+            canvas.drawString(4.5*cm, A4[1] - 1.2*cm, "BANGKO SENTRAL NG PILIPINAS")
+            canvas.drawString(4.5*cm, A4[1] - 1.5*cm, "Financial Supervision Sector")
+            # Add line
+            canvas.setStrokeColor(colors.grey)
+            canvas.setLineWidth(0.5)
+            canvas.line(2*cm, A4[1] - 2*cm, A4[0] - 2*cm, A4[1] - 2*cm)
+        canvas.restoreState()
 
     buf = BytesIO()
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        leftMargin=2 * cm,
-        rightMargin=2 * cm,
-        topMargin=2 * cm,
-        bottomMargin=2 * cm,
-        title=title or "Rewrite",
-        author="Style Writer",
+        leftMargin=3.2 * cm,
+        rightMargin=3.2 * cm,
+        topMargin=3 * cm,
+        bottomMargin=2.5 * cm,
+        title=title or "Rewritten Content",
+        author="BSP Style Writer",
     )
 
     styles = getSampleStyleSheet()
-    base = styles["BodyText"]
-    base.fontName = font_name
-    base.fontSize = 11
-    base.leading = 14
-
-    title_style = ParagraphStyle(
-        "Title",
-        parent=styles["Heading1"],
+    
+    # Custom styles matching UKB format
+    bsp_header = ParagraphStyle(
+        "BSPHeader",
         fontName=font_name,
+        fontSize=16,
+        leading=20,
+        alignment=TA_CENTER,
+        spaceAfter=6,
+    )
+    
+    cover_title = ParagraphStyle(
+        "CoverTitle",
+        fontName=font_name,
+        fontSize=12,
+        leading=16,
+        alignment=TA_CENTER,
+        spaceAfter=18,
+        spaceBefore=12,
+    )
+    
+    cover_main = ParagraphStyle(
+        "CoverMain",
+        fontName=font_name,
+        fontSize=16,
+        leading=20,
+        alignment=TA_CENTER,
+        spaceAfter=18,
+        spaceBefore=24,
+    )
+    
+    cover_subtitle = ParagraphStyle(
+        "CoverSubtitle",
+        fontName=font_name,
+        fontSize=12,
+        leading=16,
+        alignment=TA_CENTER,
         spaceAfter=12,
+    )
+    
+    cover_small = ParagraphStyle(
+        "CoverSmall",
+        fontName=font_name,
+        fontSize=11,
+        leading=14,
+        alignment=TA_CENTER,
+        spaceAfter=8,
+    )
+    
+    notice_title = ParagraphStyle(
+        "NoticeTitle",
+        fontName=font_name,
+        fontSize=12,
+        leading=16,
+        alignment=TA_CENTER,
+        spaceAfter=18,
+        spaceBefore=6,
+    )
+    
+    notice_body = ParagraphStyle(
+        "NoticeBody",
+        fontName=font_name,
+        fontSize=10,
+        leading=14,
+        alignment=TA_JUSTIFY,
+        spaceAfter=12,
+    )
+    
+    heading_style = ParagraphStyle(
+        "CustomHeading",
+        fontName=font_name,
+        fontSize=14,
+        leading=18,
+        alignment=TA_LEFT,
+        spaceAfter=16,
+        spaceBefore=12,
+    )
+    
+    body_style = ParagraphStyle(
+        "Body",
+        fontName=font_name,
+        fontSize=11,
+        leading=16,
+        alignment=TA_JUSTIFY,
+        spaceAfter=12,
+    )
+    
+    toc_style = ParagraphStyle(
+        "TOC",
+        fontName=font_name,
+        fontSize=11,
+        leading=16,
+        alignment=TA_LEFT,
+        spaceAfter=8,
     )
 
     story = []
+    
+    # === COVER PAGE ===
+    # Add BSP Logo
+    logo_path = "img/bsp-logo.png"
+    if os.path.exists(logo_path):
+        img = Image(logo_path, width=3*cm, height=3*cm)
+        img.hAlign = 'CENTER'
+        story.append(Spacer(1, 1.5 * cm))
+        story.append(img)
+        story.append(Spacer(1, 0.5 * cm))
+    else:
+        story.append(Spacer(1, 2 * cm))
+    
+    # BSP Header
+    story.append(Paragraph("<b>BANGKO SENTRAL NG PILIPINAS</b>", bsp_header))
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(Paragraph("<b>FINANCIAL SUPERVISION SECTOR</b>", cover_title))
+    story.append(Spacer(1, 2.5 * cm))
+    
+    # Main Title with box effect
+    story.append(Paragraph("<b>REPORT OF EXAMINATION</b>", cover_main))
+    story.append(Spacer(1, 1.5 * cm))
+    
     if title:
-        story.append(Paragraph(title, title_style))
-        story.append(Spacer(1, 8))
-
-    # Turn double newlines into paragraph breaks; single newlines stay inside a paragraph
+        title_safe = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph(f"<b>{title_safe}</b>", cover_subtitle))
+    
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(Paragraph("Philippines", cover_small))
+    story.append(Spacer(1, 1 * cm))
+    story.append(Paragraph("Style Rewrite", cover_small))
+    story.append(Spacer(1, 2 * cm))
+    
+    date_str = datetime.now().strftime("%d %B %Y")
+    story.append(Paragraph(f"Date Generated: {date_str}", cover_small))
+    
+    # Page break
+    story.append(PageBreak())
+    
+    # === CONFIDENTIALITY NOTICE PAGE ===
+    story.append(Spacer(1, 2 * cm))
+    story.append(Paragraph("<b>REPORT OF EXAMINATION</b>", heading_style))
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(Paragraph("<b>THIS REPORT IS STRICTLY CONFIDENTIAL</b>", notice_title))
+    story.append(Spacer(1, 0.8 * cm))
+    
+    notice_text = (
+        "This report was generated by Bangko Sentral ng Pilipinas (BSP) Style Writer application. "
+        "The content has been rewritten according to the selected editorial style guidelines. "
+        "This document is provided for internal use and review purposes. "
+        "Under no circumstance should this document or any portion thereof be disclosed or made public in any manner, "
+        "except when allowed by law, regulations, or judicial orders. "
+        "Please verify the content for accuracy and compliance before official distribution."
+    )
+    story.append(Paragraph(notice_text, notice_body))
+    
+    # Page break
+    story.append(PageBreak())
+    
+    # === TABLE OF CONTENTS ===
+    story.append(Paragraph("<b>TABLE OF CONTENTS</b>", heading_style))
+    story.append(Spacer(1, 0.8 * cm))
+    
+    toc_data = [
+        ["", "Page No."],
+        ["List of Acronyms", "i"],
+        ["Content", "1"],
+    ]
+    
+    toc_table = Table(toc_data, colWidths=[12*cm, 3*cm])
+    toc_table.setStyle(TableStyle([
+        ('FONT', (0, 0), (-1, -1), font_name, 11),
+        ('FONT', (0, 0), (-1, 0), font_name, 11),
+        ('FONTNAME', (0, 0), (-1, 0), font_name),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+    ]))
+    story.append(toc_table)
+    
+    # Page break
+    story.append(PageBreak())
+    
+    # === LIST OF ACRONYMS ===
+    story.append(Paragraph("<b>LIST OF ACRONYMS</b>", heading_style))
+    story.append(Spacer(1, 0.8 * cm))
+    
+    # Comprehensive list of BSP acronyms
+    acronyms_data = [
+        ["Acronym", "Definition"],
+        ["AC", "Audit Committee"],
+        ["ALCO", "Asset and Liability Committee"],
+        ["ALM", "Asset-Liability Management"],
+        ["AML", "Anti-Money Laundering"],
+        ["AP", "Associated Person"],
+        ["ARA", "Actual Risk Assessment"],
+        ["B2C", "Business-to-Consumer"],
+        ["BAU", "Business-as-Usual"],
+        ["BBS", "Branch Banking Services"],
+        ["BOD", "Board of Directors"],
+        ["BSP", "Bangko Sentral ng Pilipinas"],
+        ["BT", "Bancassurance"],
+        ["CAMEL", "Capital, Assets, Management, Earnings, Liquidity"],
+        ["CASA", "Current and Savings Account"],
+        ["CBS", "Core Banking System"],
+        ["CDD", "Customer Due Diligence"],
+        ["CEO", "Chief Executive Officer"],
+        ["CET", "Common Equity Tier"],
+        ["CFO", "Chief Financial Officer"],
+        ["CIMFS", "Customer Incident Management and Feedback System"],
+        ["CLO", "Chief Lending Officer"],
+        ["CMDI", "Capital Market Development Initiatives"],
+        ["COPC", "Certified Unit Selling Personnel"],
+        ["CORACTS", "Guidelines on Transaction Reporting and Compliance"],
+        ["CRO", "Chief Risk Officer"],
+        ["CTF", "Counter-Terrorism Financing"],
+        ["DCF", "Discounted Cash Flow"],
+        ["DOT", "Declaration of Trust"],
+        ["DST", "Documentary Stamp Tax"],
+        ["EaR", "Earnings at Risk"],
+        ["ECAI", "External Credit Assessment Institution"],
+        ["ECL", "Expected Credit Loss"],
+        ["ECOMM", "E-Commerce"],
+        ["ERM", "Enterprise Risk Management"],
+        ["FMS", "Financial Markets Sector"],
+        ["FOE", "Foreign-Owned Entity"],
+        ["FSS", "Financial Supervision Sector"],
+        ["FVOCI", "Fair Value through Other Comprehensive Income"],
+        ["FVPL", "Fair Value through Profit or Loss"],
+        ["GCG", "Good Corporate Governance"],
+        ["HO", "Head Office"],
+        ["HRMG", "Human Resource Management Group"],
+        ["IAS", "International Accounting Standards"],
+        ["IAASB", "Internal Audit and Regulatory Assessment Process"],
+        ["ICAAP", "Internal Capital Adequacy Assessment Process"],
+        ["IFRS", "International Financial Reporting Standards"],
+        ["IMA", "Investment Management Account"],
+        ["IRRBB", "Interest Rate Risk in the Banking Book"],
+        ["KRI", "Key Risk Indicator"],
+        ["LCR", "Liquidity Coverage Ratio"],
+        ["LGD", "Loss Given Default"],
+        ["LTV", "Loan-to-Value"],
+        ["MIS", "Management Information System"],
+        ["MORB", "Manual of Regulations for Banks"],
+        ["MORNBFI", "Manual of Regulations for Non-Bank Financial Institutions"],
+        ["NII", "Net Interest Income"],
+        ["NIM", "Net Interest Margin"],
+        ["NPL", "Non-Performing Loan"],
+        ["NSFR", "Net Stable Funding Ratio"],
+        ["ORM", "Operational Risk Management"],
+        ["PD", "Probability of Default"],
+        ["PFRS", "Philippine Financial Reporting Standards"],
+        ["RA", "Risk Assessment"],
+        ["RCSA", "Risk and Control Self-Assessment"],
+        ["ROA", "Return on Assets"],
+        ["ROE", "Return on Equity"],
+        ["RP", "Risk Profile"],
+        ["RPT", "Related Party Transaction"],
+        ["RWA", "Risk-Weighted Assets"],
+        ["SME", "Small and Medium Enterprise"],
+        ["TBA", "Treasury Bills Auction"],
+        ["VaR", "Value at Risk"],
+        ["BSFI", "BSP-Supervised Financial Institution"],
+    ]
+    
+    acronyms_table = Table(acronyms_data, colWidths=[3*cm, 12*cm])
+    acronyms_table.setStyle(TableStyle([
+        ('FONT', (0, 0), (-1, -1), font_name, 9),
+        ('FONTNAME', (0, 0), (-1, 0), font_name),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    story.append(acronyms_table)
+    
+    # Page break
+    story.append(PageBreak())
+    
+    # === MAIN CONTENT ===
+    story.append(Paragraph("<b>CONTENT</b>", heading_style))
+    story.append(Spacer(1, 0.5 * cm))
+    
+    # Header detection style
+    header_style = ParagraphStyle(
+        "HeaderText",
+        fontName=font_name,
+        fontSize=11,
+        leading=16,
+        alignment=TA_JUSTIFY,
+        spaceAfter=12,
+        spaceBefore=6,
+    )
+    
+    # Process content blocks with header detection
     for block in text.replace("\r\n", "\n").split("\n\n"):
-        # Escape simple HTML-sensitive chars for Paragraph
-        block = block.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        block = block.replace("\n", "<br/>")
-        story.append(Paragraph(block, base))
-        story.append(Spacer(1, 6))
+        if block.strip():
+            stripped_block = block.strip()
+            
+            # Detect headers: Roman numerals, numbers, or ALL CAPS lines
+            is_header = False
+            if (regex_module.match(r'^(I{1,3}V?|IV|V|VI{0,3}|IX|X{1,3}|XL|L|LX{0,3}|XC|C{1,3})\.\s+', stripped_block) or
+                regex_module.match(r'^\d+[\.\)]\s+', stripped_block) or
+                (len(stripped_block.split('\n')[0]) < 100 and stripped_block.split('\n')[0].isupper())):
+                is_header = True
+            
+            # Escape HTML-sensitive characters but preserve structure
+            block_safe = stripped_block.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            
+            # Process line by line to handle mixed content
+            lines = block_safe.split('\n')
+            formatted_lines = []
+            for line in lines:
+                if line.strip():
+                    # Check if individual line is a header
+                    line_is_header = (len(line.strip()) < 100 and line.strip().isupper()) or is_header
+                    if line_is_header:
+                        formatted_lines.append(f"<b>{line.strip()}</b>")
+                    else:
+                        formatted_lines.append(line.strip())
+            
+            final_text = "<br/>".join(formatted_lines)
+            
+            # Use appropriate style based on content type
+            if is_header:
+                story.append(Paragraph(final_text, header_style))
+            else:
+                story.append(Paragraph(final_text, body_style))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=add_page_header, onLaterPages=add_page_header)
     return buf.getvalue()
 
 
 if st.button(
     ":blue[**Rewrite Content**]",
     key="extract",
-   # disabled=content_all == ""
     disabled=(
-    content_all.strip() == ""
-    or st.session_state.style == ""
-)
-    or st.session_state.style == "",
+        content_all.strip() == ""
+        or st.session_state.style == ""
+        or st.session_state.example == ""
+    ),
 ):
+    with st.spinner("Processing..."):
+        # --- Process and store the result ---
+        output = prompts.rewrite_content(content_all, max_output_length, False)
+        
+        # Generate title for documents
+        title_text = f"Rewrite • {st.session_state.get('styleId') or 'Selected Style'}"
+        
+        # Generate PDF and DOCX bytes for both download and upload
+        docx_bytes = make_docx_bytes(output, title=title_text)
+        pdf_bytes = make_pdf_bytes(output, title=title_text)
+        
+        # Save to database and upload to blob storage
+        utils.save_output(output, content_all, pdf_bytes=pdf_bytes, docx_bytes=docx_bytes, title=title_text)
+
+        # --- Store in session state ---
+        st.session_state["last_output"] = output
+        st.session_state["last_pdf_bytes"] = pdf_bytes
+        st.session_state["last_docx_bytes"] = docx_bytes
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        style_id = (st.session_state.get("styleId") or "Style").replace(" ", "_")
+        base_name = f"rewrite_{style_id}_{ts}"
+        st.session_state["last_base_name"] = base_name
+        st.session_state["last_title"] = title_text
+        st.session_state["output_ready"] = True
+        st.rerun()
+
+# Display output and download buttons if available (only once)
+if st.session_state.get("output_ready") and st.session_state.get("last_output"):
     with st.container(border=True):
-        with st.spinner("Processing..."):
-            # --- NEW: show the result and download buttons ---
-            st.markdown("### ✨ Rewritten Output")
-            output = prompts.rewrite_content(content_all, max_output_length, False)
-            utils.save_output(output, content_all)
+        st.markdown("### ✨ Rewritten Output")
+        
+        # Show the output text
+        st.text_area(
+            "Result",
+            st.session_state["last_output"],
+            height=300,
+            key="output_display",
+        )
+        
+        # Get cached bytes or generate if not available
+        base_name = st.session_state.get("last_base_name", "rewrite")
+        title_text = st.session_state.get("last_title", "Rewrite")
+        
+        # Use cached bytes if available, otherwise generate
+        if "last_docx_bytes" in st.session_state and "last_pdf_bytes" in st.session_state:
+            docx_bytes = st.session_state["last_docx_bytes"]
+            pdf_bytes = st.session_state["last_pdf_bytes"]
+        else:
+            # Fallback: generate if not in session state
+            docx_bytes = make_docx_bytes(st.session_state["last_output"], title=title_text)
+            pdf_bytes = make_pdf_bytes(st.session_state["last_output"], title=title_text)
 
-            # --- NEW: cache for later & build filenames ---
-            st.session_state["last_output"] = output
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            style_id = (st.session_state.get("styleId") or "Style").replace(" ", "_")
-            base_name = f"rewrite_{style_id}_{ts}"
-
-            # --- NEW: build bytes for DOCX and PDF ---
-            title_text = f"Rewrite • {st.session_state.get('styleId') or 'Selected Style'}"
-            docx_bytes = make_docx_bytes(output, title=title_text)
-            pdf_bytes = make_pdf_bytes(output, title=title_text)
-
-           # st.text_area("Result", output, height=300)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "⬇️ Download as DOCX",
-                    data=docx_bytes,
-                    file_name=f"{base_name}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-            with c2:
-                st.download_button(
-                    "⬇️ Download as PDF",
-                    data=pdf_bytes,
-                    file_name=f"{base_name}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "⬇️ Download as DOCX",
+                data=docx_bytes,
+                file_name=f"{base_name}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                width='stretch',
+                key="download_docx",
+            )
+        with c2:
+            st.download_button(
+                "⬇️ Download as PDF",
+                data=pdf_bytes,
+                file_name=f"{base_name}.pdf",
+                mime="application/pdf",
+                width='stretch',
+                key="download_pdf",
+            )

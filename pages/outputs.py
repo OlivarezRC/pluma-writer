@@ -6,8 +6,47 @@ import app.utils as utils
 pages.show_home()
 pages.show_sidebar()
 
-st.header("📰Generated Outputs")
+st.header("📰 Generated Outputs")
 
-# Display the generated outputs
-with st.spinner("Processing..."):
-    utils.get_outputs()
+# Style Writer Outputs Section
+st.subheader("Style Writer Outputs")
+with st.spinner("Loading Style Writer outputs..."):
+    outputs_df = utils.get_outputs()
+    if outputs_df is not None:
+        st.dataframe(
+            outputs_df,
+            column_config={
+                "updatedAt": st.column_config.DatetimeColumn("Created At", format="YYYY-MM-DD HH:mm:ss", width="medium"),
+                "user_name": st.column_config.TextColumn("User Email", width="small"),
+                "styleId": st.column_config.TextColumn("Style ID", width="small"),
+                "content": st.column_config.TextColumn("Input Content", width="medium", help="Original content"),
+                "output": st.column_config.TextColumn("Output", width="large", help="Rewritten output"),
+                "pdf": st.column_config.LinkColumn("Output PDF", display_text="Download PDF", width="small"),
+                "docx": st.column_config.LinkColumn("Output DOCX", display_text="Download DOCX", width="small")
+            },
+            height=600,
+            use_container_width=True,
+            hide_index=True
+        )
+
+st.divider()
+
+# Style Reader Outputs Section
+st.subheader("Style Reader Outputs")
+with st.spinner("Loading Style Reader outputs..."):
+    styles_df = utils.get_styles_outputs()
+    if styles_df is not None:
+        st.dataframe(
+            styles_df,
+            column_config={
+                "updatedAt": st.column_config.DatetimeColumn("Created At", format="YYYY-MM-DD HH:mm:ss", width="medium"),
+                "user_name": st.column_config.TextColumn("User Email", width="small"),
+                "name": st.column_config.TextColumn("Style Name", width="medium"),
+                "style": st.column_config.TextColumn("Style Guidelines", width="large", help="Style guidelines"),
+                "example": st.column_config.TextColumn("Example", width="large", help="Style example")
+            },
+            height=600,
+            use_container_width=True,
+            hide_index=True
+        )
+
