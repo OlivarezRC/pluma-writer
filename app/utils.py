@@ -39,7 +39,7 @@ def ensure_containers_exist():
         # Define container configurations
         containers_config = [
             {
-                "name": "styles",
+                "name": "styles_from_speeches",
                 "partition_key": PartitionKey(path="/user_id"),
                 "unique_keys": [{"paths": ["/name"]}]
             },
@@ -77,7 +77,7 @@ database = cosmos_client.get_database_client(os.getenv("AZURE_COSMOS_DATABASE"))
 ensure_containers_exist()
 
 # Get container references after ensuring they exist
-styles_container = database.get_container_client("styles")
+styles_container = database.get_container_client("styles_from_speeches")
 outputs_container = database.get_container_client("outputs")
 
 # Initialize Azure Blob Storage client
@@ -166,21 +166,13 @@ def read_json(file_path):
 # get styles from database
 def get_styles():
     try:
-        # Get current user info from Streamlit context
-        headers = st.context.headers
-        user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
-        
-        if not user_id:
-            st.warning("User not authenticated")
-            return []
-            
-        # Query items for the current user
+        # Fetch all style fingerprints from the new container
         query = """
-        SELECT * 
-        FROM c 
-        WHERE c.user_id IN (@user_id, 'allbsp')
+        SELECT *
+        FROM c
+        WHERE c.doc_kind = 'style_fingerprint'
         """
-        parameters = [{"name": "@user_id", "value": user_id}]
+        parameters = []
         items = list(styles_container.query_items(
             query=query,
             parameters=parameters,
@@ -190,6 +182,75 @@ def get_styles():
     except exceptions.CosmosHttpResponseError as e:
         st.error(f"An error occurred while fetching styles: {e}")
         return []
+
+
+def get_rulebook(rulebook_id: str):
+    try:
+        if not rulebook_id:
+            return None
+        query = "SELECT * FROM c WHERE c.id = @id OR c.container_key = @id"
+        parameters = [{"name": "@id", "value": rulebook_id}]
+        items = list(styles_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        return items[0] if items else None
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while fetching global rules: {e}")
+        return None
+
+
+def get_rulebooks():
+    try:
+        query = "SELECT * FROM c WHERE c.doc_kind = 'global_rulebook'"
+        items = list(styles_container.query_items(
+            query=query,
+            parameters=[],
+            enable_cross_partition_query=True
+        ))
+        return items
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while fetching global rulebooks: {e}")
+        return []
+
+
+def get_style_fingerprint(speaker: str, audience: str):
+    try:
+        if not speaker or not audience:
+            return None
+        query = """
+        SELECT *
+        FROM c
+        WHERE c.doc_kind = 'style_fingerprint'
+          AND c.speaker = @speaker
+          AND c.audience_setting_classification = @audience
+        """
+        parameters = [
+            {"name": "@speaker", "value": speaker},
+            {"name": "@audience", "value": audience},
+        ]
+        items = list(styles_container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+        return items[0] if items else None
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while fetching style rules: {e}")
+        return None
+
+
+def extract_rulebook_text(rulebook: dict) -> str:
+    if not rulebook:
+        return ""
+    for key in ["global_rules", "rules", "rulebook", "rulebook_text"]:
+        if key in rulebook and rulebook[key]:
+            return rulebook[key]
+    try:
+        return json.dumps(rulebook, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(rulebook)
 
 
 # check if style name exists
@@ -344,6 +405,31 @@ def save_style(style, combined_text):
         styles_container.create_item(body=new_style)
     except exceptions.CosmosHttpResponseError as e:
         st.error(f"An error occurred while saving style: {e}")
+
+
+def save_style_fingerprint(style_doc: dict) -> bool:
+    try:
+        if not style_doc:
+            st.warning("No style document to save.")
+            return False
+
+        headers = st.context.headers
+        user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
+
+        doc = dict(style_doc)
+        if "user_id" not in doc:
+            doc["user_id"] = user_id
+
+        doc["updatedAt"] = datetime.now().isoformat()
+
+        for key in [k for k in doc.keys() if k.startswith("_")]:
+            doc.pop(key, None)
+
+        styles_container.upsert_item(body=doc)
+        return True
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while saving style: {e}")
+        return False
 
 
 # save output to database

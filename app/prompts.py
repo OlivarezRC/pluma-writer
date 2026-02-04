@@ -22,11 +22,12 @@ def extract_style(combined_text, debug):
 
 def rewrite_content(content_all, max_output_length, debug):
     system = [
-        "You are an expert writer assistant. Rewrite the user input based on the following writing style, writing guidelines and writing example.\n",
+        "You are an expert writer assistant. Rewrite the user input based on the following writing style, global rules, writing guidelines and writing example.\n",
         f"<writingStyle>{st.session_state.style}</writingStyle>\n",
+        f"<globalRules>{st.session_state.global_rules}</globalRules>\n",
         f"<writingGuidelines>{st.session_state.guidelines}</writingGuidelines>\n",
         f"<writingExample>{st.session_state.example}</writingExample>\n",
-        "Make sure to emulate the writing style, guidelines and example provided above.",
+        "Make sure to emulate the writing style, global rules, guidelines and example provided above.",
         f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} WORDS"
     ]
     

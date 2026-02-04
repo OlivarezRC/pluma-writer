@@ -1,57 +1,27 @@
+import json
 import streamlit as st
 import app.pages as pages
 import app.utils as utils
-import app.prompts as prompts
-from PyPDF2 import PdfReader
-from docx import Document
-from pptx import Presentation
-from io import BytesIO
 
 
-# --- UI helper: centered "OR" header with lines ---
-def or_header(text: str):
-    st.markdown(
-        """
-        <style>
-        .or-header{display:flex;align-items:center;gap:.75rem;margin:.5rem 0 1rem;}
-        .or-header:before,.or-header:after{content:"";flex:1;border-top:1px solid rgba(128,128,128,.35);}
-        .or-header .or-text{font-weight:600;opacity:.85;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(f"<div class='or-header'><span class='or-text'>{text}</span></div>", unsafe_allow_html=True)
+def _split_style_name(name: str):
+    if "_" in name:
+        speaker, audience = name.split("_", 1)
+        return speaker.strip(), audience.strip()
+    return name.strip(), "General"
 
-# App title
-pages.show_home()
-pages.show_sidebar()
 
-st.header("🔍Style Reader")
+def _format_section_title(text: str) -> str:
+    return str(text).replace("_", " ").replace("-", " ").strip()
 
-# st.session_state.exampleText = st.text_area(
-#     ":blue[**Reference Input for BSP Writing Style :**]", st.session_state.exampleText, 200
-# )
 
-# uploaded_files = st.file_uploader(
-#     ":blue[**Upload Example Files:**]", 
-#     type=["pdf", "docx", "pptx"], 
-#     accept_multiple_files=True,
-#     help="Upload PDF, Word, or PowerPoint files"
-# )
+def _value_to_editor_text(value) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    if isinstance(value, list):
+        return "\n".join([str(v) for v in value])
+    return "" if value is None else str(value)
 
-or_header("Input the Contents or Upload the File for BSP Style Reading")
-
-# --- two-column layout (Col 1 / Col 2) ---
-col1, col2 = st.columns([3, 2], gap="small")
-
-with col1:
-    
-    st.session_state.content = st.text_area(
-        ":blue[**Input Content:**]",
-        st.session_state.content,
-        height=160,
-        key="content_input",
-    )
 
 with col2:
     
@@ -177,33 +147,65 @@ else:
     combined_text = ""
     st.markdown(
     """
-    <div class="bsp-alert-red" role="alert">
-      <strong>Heads up:</strong> Provide content — either type in the left box or upload a file on the right.
-    </div>
     <style>
-      .bsp-alert-red{
-        padding:12px 14px;
-        margin: 4px 0 10px;
-        border-radius:10px;
-        border:1px solid rgba(220,53,69,.35);
-        background: rgba(220,53,69,.08); /* light red */
-        font-size: 0.95rem;
-      }
-      .bsp-alert-red strong{
-        color:#b02a37; /* dark red for emphasis */
-      }
+    .stButton{width:100%;}
+    .stButton > button{
+        width:100%;
+        border-radius:12px;
+        padding:0.95rem 1.1rem;
+        text-align:center;
+        min-height:56px;
+        height:56px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        border:1px solid rgba(0,0,0,.12);
+        background:linear-gradient(180deg,#ffffff 0%,#f7f8fb 100%);
+        box-shadow:0 6px 14px rgba(15,23,42,.08), 0 1px 2px rgba(15,23,42,.06);
+        font-weight:600;
+        transition:transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+    }
+    .stButton > button:hover{
+        border-color:rgba(30,64,175,.35);
+        box-shadow:0 10px 20px rgba(15,23,42,.12), 0 2px 6px rgba(15,23,42,.08);
+        transform:translateY(-1px);
+    }
+    .stButton > button:active{
+        transform:translateY(0);
+        box-shadow:0 4px 10px rgba(15,23,42,.12);
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.session_state.styleName = st.text_input(
-    ":blue[**Input Style Name:**]", st.session_state.styleName, 100
-)
+styles = utils.get_styles()
+if not styles:
+    st.info("No styles found.")
+    st.stop()
 
+speaker_map = {}
+global_rulebooks = {}
+for item in utils.get_rulebooks():
+    rulebook_id = item.get("id") or item.get("container_key")
+    if rulebook_id:
+        global_rulebooks[rulebook_id] = item
+for item in styles:
+    if item.get("doc_kind") and item.get("doc_kind") != "style_fingerprint":
+        continue
+    name = item.get("name") or item.get("container_key") or item.get("id") or ""
+    speaker = item.get("speaker")
+    audience = item.get("audience_setting_classification")
+    if not speaker or not audience:
+        speaker, audience = _split_style_name(str(name))
+    speaker_map.setdefault(speaker, {})[audience] = item
 
-# Combine text area and extracted content
-#combined_text = st.session_state.exampleText + "\n" + extracted_text.encode("ascii", errors="ignore").decode("ascii")
+st.session_state.setdefault("editor_selected_speaker", None)
+st.session_state.setdefault("editor_selected_audience", None)
+st.session_state.setdefault("selected_global_rulebook_id", None)
 
 if st.button(
     ":blue[**Extract Writing Style**]",
