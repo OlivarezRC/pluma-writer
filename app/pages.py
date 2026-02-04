@@ -16,10 +16,10 @@ def show_home():
     with st.sidebar:
         st.image(
             "https://upload.wikimedia.org/wikipedia/commons/c/cb/Bangko_Sentral_ng_Pilipinas_2020_logo.png",
-           use_container_width=True ,
+           width='stretch',
         )
         st.markdown("### ✍️ Pluma")
-        st.caption("BSP Style Writer • Edit, format, and validate content against your style guide.")
+        st.caption("Style Writer • Edit, format, and validate content against your style guide.")
         st.divider()
         # (Optional) 
         # st.session_state.current_view = st.radio(

@@ -1,4 +1,6 @@
 import streamlit as st
+import os
+import json
 import app.pages as pages
 import app.utils as utils
 from azure.cosmos import exceptions
@@ -69,6 +71,29 @@ with st.expander("Authentication Details"):
         # st.write(headers)
     else:
         st.warning("No authentication headers found. Make sure you're running this app in Azure App Service with authentication enabled.")
+
+# Load admin users from environment variable
+admin_users_str = os.getenv("USER_ADMIN", "[]")
+try:
+    # Handle both list and comma-separated string formats
+    if admin_users_str.startswith('['):
+        admin_users = json.loads(admin_users_str)
+    else:
+        admin_users = [u.strip() for u in admin_users_str.split(',') if u.strip()]
+except:
+    admin_users = []
+
+# Get current user from headers
+headers = st.context.headers
+current_user = headers.get('X-MS-CLIENT-PRINCIPAL-NAME', '') if headers else ''
+
+# Check if user is admin
+is_admin = current_user in admin_users
+
+# Only show delete functionality to admins
+if not is_admin:
+    st.warning("⚠️ Style deletion is restricted to administrators only.")
+    st.stop()
 
 # Get all styles
 styles = utils.get_styles()
