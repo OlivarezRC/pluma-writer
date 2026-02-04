@@ -39,6 +39,10 @@ def show_home():
         st.session_state.content = ""
     if "style" not in st.session_state:
         st.session_state.style = ""
+    if "style_rules" not in st.session_state:
+        st.session_state.style_rules = {}
+    if "selected_style_doc" not in st.session_state:
+        st.session_state.selected_style_doc = {}
     if "styleName" not in st.session_state:
         st.session_state.styleName = ""
     if "guidelines" not in st.session_state:
@@ -47,6 +51,10 @@ def show_home():
         st.session_state.example = ""
     if "exampleText" not in st.session_state:
         st.session_state.exampleText = ""
+    if "global_rules" not in st.session_state:
+        st.session_state.global_rules = ""
+    if "global_rulebook" not in st.session_state:
+        st.session_state.global_rulebook = {}
     if "locals" not in st.session_state:
         st.session_state.locals = utils.read_json("data/local_data.json")
 
@@ -68,7 +76,7 @@ def show_sidebar():
     with st.sidebar:
         with st.container(border=True):
             st.page_link("app.py", label="Style Writer", icon="📝")
-            st.page_link("pages/reader.py", label="Style Reader", icon="🔍")
+            st.page_link("pages/reader.py", label="Style Editor", icon="✏️")
             st.page_link("pages/outputs.py", label="Generated Outputs", icon="📰")
             st.page_link("pages/settings.py", label="Settings", icon="⚙️")
 
