@@ -15,7 +15,7 @@ def extract_style(combined_text, debug):
     return utils.chat(messages, 0)
 
 
-def rewrite_content(content_all, max_output_length, debug):
+def rewrite_content(content_all, max_output_length, debug, context_details=""):
     system = [
         "You are an expert writer assistant. Rewrite the user input based on the following writing style, global rules, writing guidelines and writing example.\n",
         f"<writingStyle>{st.session_state.style}</writingStyle>\n",
@@ -23,8 +23,15 @@ def rewrite_content(content_all, max_output_length, debug):
         f"<writingGuidelines>{st.session_state.guidelines}</writingGuidelines>\n",
         f"<writingExample>{st.session_state.example}</writingExample>\n",
         "Make sure to emulate the writing style, global rules, guidelines and example provided above.",
-        f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} WORDS"
+        f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
     ]
+
+    if context_details:
+        system.insert(
+            -1,
+            "Use this optional context to shape greetings and situational considerations:\n"
+            f"<speechContext>{context_details}</speechContext>\n",
+        )
 
     messages = [
         {"role": "system", "content": "\n".join(system)},
@@ -33,4 +40,7 @@ def rewrite_content(content_all, max_output_length, debug):
 
     if debug:
         st.write(messages)
-    return utils.chat(messages, 0.7)
+    output = utils.chat(messages, 0.7)
+    if output:
+        return output[:max_output_length]
+    return output
