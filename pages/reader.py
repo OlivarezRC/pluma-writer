@@ -31,6 +31,63 @@ def _parse_editor_text(value, original_type):
     return value
 
 
+def _unwrap_schema_properties(props: dict):
+    if not isinstance(props, dict):
+        return props
+    if "properties" in props and isinstance(props["properties"], dict):
+        if props.get("type") == "object" or "required" in props:
+            return props["properties"]
+    return props
+
+
+def _find_nested_schema(props: dict, key: str):
+    if not isinstance(props, dict):
+        return None
+    if key in props and isinstance(props[key], dict):
+        return props[key]
+    for value in props.values():
+        if isinstance(value, dict):
+            found = _find_nested_schema(value, key)
+            if found:
+                return found
+    return None
+
+
+def _schema_debug_info(doc: dict) -> dict:
+    if not isinstance(doc, dict):
+        return {"doc": "invalid"}
+    props = doc.get("properties")
+    props_type = type(props).__name__
+    if isinstance(props, str):
+        try:
+            props = json.loads(props)
+        except Exception:
+            props = None
+    info = {
+        "doc_keys": list(doc.keys())[:30],
+        "properties_type": props_type,
+    }
+    if isinstance(props, dict):
+        info["properties_keys"] = list(props.keys())[:30]
+        nested = props.get("properties") if isinstance(props.get("properties"), dict) else {}
+        info["nested_properties_keys"] = list(nested.keys())[:30]
+        info["has_style_instructions"] = "style_instructions" in props or "style_instructions" in nested
+        info["has_style"] = "style" in props or "style" in nested
+        info["has_style_sections"] = any(
+            k in props
+            for k in [
+                "register_profile",
+                "stylistics",
+                "pragmatics",
+                "semantics_frames",
+                "discourse_structure",
+                "signature_moves",
+                "evidence_spans",
+            ]
+        )
+    return info
+
+
 def _coerce_style_schema(doc: dict) -> dict:
     if not doc:
         return {}
@@ -40,10 +97,29 @@ def _coerce_style_schema(doc: dict) -> dict:
             props = json.loads(props)
         except Exception:
             props = {}
+    props = _unwrap_schema_properties(props)
     if isinstance(props, dict):
         nested = props.get("style_instructions") or props.get("style")
         if isinstance(nested, dict):
             return nested
+        nested = _find_nested_schema(props, "style_instructions") or _find_nested_schema(props, "style")
+        if isinstance(nested, dict):
+            return nested
+        # Some schemas store editable sections directly under properties
+        if props:
+            style_keys = {
+                "register_profile",
+                "stylistics",
+                "pragmatics",
+                "semantics_frames",
+                "discourse_structure",
+                "signature_moves",
+                "evidence_spans",
+                "style_instructions",
+                "style",
+            }
+            filtered = {k: v for k, v in props.items() if k in style_keys}
+            return {"properties": filtered or props}
     candidate = doc.get("style_instructions") or doc.get("style")
     if isinstance(candidate, str):
         try:
@@ -81,7 +157,33 @@ def _state_key(path: list[str]) -> str:
     return "edit_schema_" + "__".join(path)
 
 
-def _render_schema_fields(node: dict, path: list[str]):
+def _get_value_from_data(data, path: list[str]):
+    if not data or not isinstance(data, dict):
+        return None
+    if path:
+        path = path[1:]
+    current = data
+    for key in path:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return None
+    return current
+
+
+def _editor_default_value(node_type: str, value) -> str:
+    if value is None:
+        return ""
+    if node_type == "array":
+        if isinstance(value, list):
+            return "\n".join([str(v) for v in value])
+        return _value_to_editor_text(value)
+    if isinstance(value, (dict, list)):
+        return _value_to_editor_text(value)
+    return str(value)
+
+
+def _render_schema_fields(node: dict, path: list[str], data_root=None):
     node_type = _schema_node_type(node)
     if node_type == "object":
         for key, child in (node.get("properties") or {}).items():
@@ -89,18 +191,18 @@ def _render_schema_fields(node: dict, path: list[str]):
             label = _format_section_title(key)
             if child_type == "object":
                 st.markdown(f"**{label}**")
-                _render_schema_fields(child, path + [key])
+                _render_schema_fields(child, path + [key], data_root)
             else:
-                _render_schema_fields(child, path + [key])
+                _render_schema_fields(child, path + [key], data_root)
         return
 
     state_key = _state_key(path)
     if state_key not in st.session_state:
         value = _schema_value_from_enum(node)
-        if node_type == "array":
-            st.session_state[state_key] = "\n".join([str(v) for v in value])
-        else:
-            st.session_state[state_key] = "" if value is None else str(value)
+        data_value = _get_value_from_data(data_root, path)
+        if data_value is not None:
+            value = data_value
+        st.session_state[state_key] = _editor_default_value(node_type, value)
 
     label = _format_section_title(path[-1])
     if node_type == "array":
@@ -317,6 +419,8 @@ if selected_speaker and selected_audience:
     style_schema = _coerce_style_schema(selected_doc)
     if not isinstance(style_schema, dict) or not style_schema:
         st.warning("This style has no editable style schema.")
+        with st.expander("Schema Debug", expanded=False):
+            st.write(_schema_debug_info(selected_doc))
         st.stop()
 
     schema_properties = style_schema.get("properties") if isinstance(style_schema, dict) else {}
@@ -329,7 +433,8 @@ if selected_speaker and selected_audience:
         for section, section_schema in schema_properties.items():
             section_title = _format_section_title(section)
             with st.expander(section_title, expanded=False):
-                _render_schema_fields(section_schema, [doc_id, section])
+                data_root = selected_doc.get("style_instructions") or selected_doc.get("style") or {}
+                _render_schema_fields(section_schema, [doc_id, section], data_root)
     elif isinstance(style_schema, dict) and style_schema:
         value_sections = style_schema
         for section, value in value_sections.items():

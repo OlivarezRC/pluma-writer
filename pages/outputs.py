@@ -29,24 +29,4 @@ with st.spinner("Loading Style Writer outputs..."):
             hide_index=True
         )
 
-st.divider()
-
-# Style Reader Outputs Section
-st.subheader("Style Reader Outputs")
-with st.spinner("Loading Style Reader outputs..."):
-    styles_df = utils.get_styles_outputs()
-    if styles_df is not None:
-        st.dataframe(
-            styles_df,
-            column_config={
-                "updatedAt": st.column_config.DatetimeColumn("Created At", format="YYYY-MM-DD HH:mm:ss", width="medium"),
-                "user_name": st.column_config.TextColumn("User Email", width="small"),
-                "name": st.column_config.TextColumn("Style Name", width="medium"),
-                "style": st.column_config.TextColumn("Style Guidelines", width="large", help="Style guidelines"),
-                "example": st.column_config.TextColumn("Example", width="large", help="Style example")
-            },
-            height=600,
-            use_container_width=True,
-            hide_index=True
-        )
 

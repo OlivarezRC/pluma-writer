@@ -67,6 +67,14 @@ with col1:
         key="content_input",
     )
 
+    st.text_area(
+        ":blue[**Setting / Location / Conference / Partners (Optional):**]",
+        st.session_state.get("context_details", ""),
+        height=90,
+        help="Optional context to guide greetings and speech considerations.",
+        key="context_details",
+    )
+
     MIN_LEN, MAX_LEN, DEFAULT_LEN = 20, 75_000, 1_000
 
     # One source of truth
@@ -483,75 +491,74 @@ if selected_speaker and selected_audience:
         st.session_state.global_rulebook = rulebook or {}
         st.session_state.global_rules = utils.extract_rulebook_text(rulebook)
 
+show_loaded_rules = False
 
- 
-
-
-with st.container(border=True):
-    st.subheader("Loaded Style & Global Rules")
-    if not (selected_speaker and selected_audience):
-        st.info("Select a speaker and audience/setting to view the loaded rules.")
-    else:
-        selected_doc = st.session_state.get("selected_style_doc") or {}
-        style_source = st.session_state.get("style_rules") or _extract_style_rules(selected_doc) or st.session_state.get("style") or {}
-        global_rulebook = _coerce_global_rulebook()
-
-        st.markdown("**Style Rules**")
-        if style_source:
-            if isinstance(style_source, dict):
-                rule_items = list(style_source.items())
-                mid_point = (len(rule_items) + 1) // 2
-                col1, col2 = st.columns(2)
-                with col1:
-                    for section, value in rule_items[:mid_point]:
-                        section_title = _format_section_title(section)
-                        with st.expander(section_title, expanded=False):
-                            _render_rule_section(section_title, value)
-                with col2:
-                    for section, value in rule_items[mid_point:]:
-                        section_title = _format_section_title(section)
-                        with st.expander(section_title, expanded=False):
-                            _render_rule_section(section_title, value)
-            else:
-                _render_rule_section("Style Rules", style_source)
+if show_loaded_rules:
+    with st.container(border=True):
+        st.subheader("Loaded Style & Global Rules")
+        if not (selected_speaker and selected_audience):
+            st.info("Select a speaker and audience/setting to view the loaded rules.")
         else:
-            st.caption("No style rules loaded.")
+            selected_doc = st.session_state.get("selected_style_doc") or {}
+            style_source = st.session_state.get("style_rules") or _extract_style_rules(selected_doc) or st.session_state.get("style") or {}
+            global_rulebook = _coerce_global_rulebook()
 
-        st.markdown("**Global Rules**")
-        if global_rulebook:
-            if isinstance(global_rulebook, dict):
-                filtered_rulebook = _filter_global_rulebook(global_rulebook)
-                rule_items = list(filtered_rulebook.items())
-                if not rule_items:
-                    st.caption("No global rules loaded.")
-                    rule_items = []
-                mid_point = (len(rule_items) + 1) // 2
-                col1, col2 = st.columns(2)
-                with col1:
-                    for section, value in rule_items[:mid_point]:
-                        section_title = _format_section_title(section)
-                        with st.expander(section_title, expanded=False):
-                            _render_rule_section(section_title, value)
-                with col2:
-                    for section, value in rule_items[mid_point:]:
-                        section_title = _format_section_title(section)
-                        with st.expander(section_title, expanded=False):
-                            _render_rule_section(section_title, value)
+            st.markdown("**Style Rules**")
+            if style_source:
+                if isinstance(style_source, dict):
+                    rule_items = list(style_source.items())
+                    mid_point = (len(rule_items) + 1) // 2
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        for section, value in rule_items[:mid_point]:
+                            section_title = _format_section_title(section)
+                            with st.expander(section_title, expanded=False):
+                                _render_rule_section(section_title, value)
+                    with col2:
+                        for section, value in rule_items[mid_point:]:
+                            section_title = _format_section_title(section)
+                            with st.expander(section_title, expanded=False):
+                                _render_rule_section(section_title, value)
+                else:
+                    _render_rule_section("Style Rules", style_source)
             else:
-                _render_rule_section("Global Rules", global_rulebook)
-        else:
-            st.caption("No global rules loaded.")
+                st.caption("No style rules loaded.")
 
-        with st.expander("Style Debug", expanded=False):
-            st.write({
-                "selected_speaker": selected_speaker,
-                "selected_audience": selected_audience,
-                "style_doc_loaded": bool(selected_doc),
-                "style_doc_keys": list(selected_doc.keys())[:25],
-                "has_style_instructions": "style_instructions" in selected_doc,
-                "has_register_profile": "register_profile" in selected_doc,
-                "style_rules_keys": list(style_source.keys())[:25] if isinstance(style_source, dict) else [],
-            })
+            st.markdown("**Global Rules**")
+            if global_rulebook:
+                if isinstance(global_rulebook, dict):
+                    filtered_rulebook = _filter_global_rulebook(global_rulebook)
+                    rule_items = list(filtered_rulebook.items())
+                    if not rule_items:
+                        st.caption("No global rules loaded.")
+                        rule_items = []
+                    mid_point = (len(rule_items) + 1) // 2
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        for section, value in rule_items[:mid_point]:
+                            section_title = _format_section_title(section)
+                            with st.expander(section_title, expanded=False):
+                                _render_rule_section(section_title, value)
+                    with col2:
+                        for section, value in rule_items[mid_point:]:
+                            section_title = _format_section_title(section)
+                            with st.expander(section_title, expanded=False):
+                                _render_rule_section(section_title, value)
+                else:
+                    _render_rule_section("Global Rules", global_rulebook)
+            else:
+                st.caption("No global rules loaded.")
+
+            with st.expander("Style Debug", expanded=False):
+                st.write({
+                    "selected_speaker": selected_speaker,
+                    "selected_audience": selected_audience,
+                    "style_doc_loaded": bool(selected_doc),
+                    "style_doc_keys": list(selected_doc.keys())[:25],
+                    "has_style_instructions": "style_instructions" in selected_doc,
+                    "has_register_profile": "register_profile" in selected_doc,
+                    "style_rules_keys": list(style_source.keys())[:25] if isinstance(style_source, dict) else [],
+                })
         
 # st.session_state.style = st.text_area(":blue[**Style:**]", st.session_state.style)
 
@@ -701,7 +708,13 @@ if st.button(
         with st.spinner("Processing..."):
             # --- NEW: show the result and download buttons ---
             st.markdown("### ✨ Rewritten Output")
-            output = prompts.rewrite_content(content_all, max_output_length, False)
+            context_details = st.session_state.get("context_details", "").strip()
+            output = prompts.rewrite_content(
+                content_all,
+                max_output_length,
+                False,
+                context_details,
+            )
             utils.save_output(output, content_all)
 
             # --- NEW: cache for later & build filenames ---
