@@ -1,0 +1,73 @@
+{
+  "success": true,
+  "timestamp": "2026-02-12T07:04:44.387919",
+  "speech_metadata": {
+    "id": "test_speech_001",
+    "speaker": "Test Speaker",
+    "institution": "Test Institution",
+    "date": "2026-02-12"
+  },
+  "overall_risk_score": 0.0,
+  "overall_risk_level": "minimal",
+  "statistics": {
+    "total_chunks": 7,
+    "total_words": 248,
+    "high_risk_chunks": 0,
+    "medium_risk_chunks": 0,
+    "low_risk_chunks": 0,
+    "clean_chunks": 7
+  },
+  "top_sources": [],
+  "flagged_chunks": [],
+  "all_chunk_analyses": [
+    {
+      "chunk_id": "test_speech_001_chunk_000",
+      "paragraph_index": 0,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_001",
+      "paragraph_index": 1,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_002",
+      "paragraph_index": 2,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_003",
+      "paragraph_index": 3,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_004",
+      "paragraph_index": 4,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_005",
+      "paragraph_index": 5,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    },
+    {
+      "chunk_id": "test_speech_001_chunk_006",
+      "paragraph_index": 6,
+      "risk_score": 0.0,
+      "risk_level": "none",
+      "match_count": 0
+    }
+  ]
+}

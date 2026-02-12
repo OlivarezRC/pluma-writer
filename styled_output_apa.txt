@@ -1,0 +1,48 @@
+Query: What are transformer neural networks and their key innovations?
+
+Style: None
+Speaker: Benjamin E. Diokno
+Audience: PUBLIC_REGIONAL
+
+======================================================================
+STYLED OUTPUT (APA FORMAT)
+======================================================================
+
+Good afternoon and welcome to our discussion on transformer neural networks and their key innovations.
+
+Transformers are deep learning architectures that changed how we process sequences by using attention mechanisms, removing the need for recurrence or convolution (Vaswani et al., 2017; Ashish Vaswani et al., 2017). The original design used an encoder-decoder structure with multi-head self-attention to enable parallel computation and strong sequence modeling (Vaswani et al., 2017; Ashish Vaswani et al., 2017). It reached state-of-the-art machine translation results of 28.4 BLEU for English-German and 41.8 BLEU for English-French, while cutting training time to 3.5 days on 8 GPUs (Ashish Vaswani et al., 2017). The same design also adapted well to constituency parsing, showing its generalizability across tasks (Ashish Vaswani et al., 2017).
+
+In recent years, scaling has brought new gains. Mixture-of-Experts architectures such as Switch Transformer use 1.6 trillion parameters spread across 2048 specialized experts to outperform dense models with 170B parameters (Medium, n.d.; r/MachineLearning, n.d.). Distributed deployment now uses serverless computing and predictive routing to optimize resources (arXiv, 2025). Architectural refinements also help maintain balanced performance as models reach trillion-parameter scales (LinkedIn, n.d.).
+
+Advances also pair transformers with complementary components to improve efficiency and reach. Some combine transformers with convolutional layers to inject spatial bias and strengthen local feature processing (Boreal Times, n.d.). Others integrate State-Space Models to enable linear-time sequence handling (Boreal Times, n.d.). There are also neuro-symbolic integrations that blend pattern recognition with structured reasoning (Boreal Times, n.d.). These hybrids are effective in vision tasks such as HAT and MambaVision, in medical imaging via UTNet, and in point cloud processing (Boreal Times, n.d.), addressing computational intensity and broadening applicability at the same time (Boreal Times, n.d.).
+
+Frontier work explores quantum-inspired and quantum-enhanced directions. One line models attention as quantum field interactions that include spacetime dynamics (Medium, n.d.). Another uses parameterized quantum circuits, including QKV-only mappings and Quantum Pairwise Attention (arXiv, n.d.). There are also NN-QFT frameworks that reveal correlations between transformer operations and quantum field theory (arXiv, 2026). Together, these efforts offer new ways to understand context propagation and to build hybrid quantum-classical systems (arXiv, 2026).
+
+Before I close, let me underline the direction we see. The evolution of this architecture points to task-optimized systems that balance parameter growth, computational efficiency, and cross-modal capabilities through strategic hybridization of components (Boreal Times, n.d.; Emergent Mind, n.d.).
+
+Before I end, allow me to thank everyone for joining this session and for your commitment to shared learning. These innovations matter because they open paths to more capable, efficient, and adaptable models that can serve many communities and applications. Again, good afternoon and thank you all for coming. Maraming salamat at mabuhay!
+
+======================================================================
+REFERENCES
+======================================================================
+
+Ashish Vaswani et al. (2017). Attention Is All You Need. arXiv. https://arxiv.org/abs/1706.03762
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., & Polosukhin, I. (2017). Attention Is All You Need. arXiv. https://arxiv.org/abs/1706.03762
+
+Boreal Times (n.d.). transformer neural networks. Boreal Times. Retrieved from Deep Research: transformer neural networks
+
+Emergent Mind (n.d.). transformer neural networks. Task-Optimised Neural Networks. Retrieved from Deep Research: transformer neural networks
+
+LinkedIn (n.d.). transformer neural networks. LinkedIn. Retrieved from Deep Research: transformer neural networks
+
+Medium (n.d.). transformer neural networks. Medium. Retrieved from Deep Research: transformer neural networks
+
+arXiv (2025). transformer neural networks. arXiv. Deep Research: transformer neural networks
+
+arXiv (2026). transformer neural networks. Neural Network Quantum Field Theory from Transformer Architectures. Deep Research: transformer neural networks
+
+arXiv (n.d.). transformer neural networks. arXiv. Retrieved from Deep Research: transformer neural networks
+
+r/MachineLearning (n.d.). transformer neural networks. Reddit. Retrieved from Deep Research: transformer neural networks
+
