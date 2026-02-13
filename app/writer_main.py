@@ -31,6 +31,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 # Import plagiarism checker
 from app.plagiarism_checker import check_plagiarism
 
+# Import policy checker
+from app.policy_checker import check_speech_policy_alignment
+
 
 # Model initialization for link processing - lazy loaded
 _link_processing_model = None
@@ -1742,19 +1745,21 @@ async def process_with_iterative_refinement_and_style(
     query: str,
     sources: Dict[str, Any],
     max_iterations: int = 3,
-    style: Optional[Dict[str, Any]] = None
+    style: Optional[Dict[str, Any]] = None,
+    enable_policy_check: bool = True
 ) -> Dict[str, Any]:
     """
-    Complete pipeline: Iterative refinement + Style-based output generation.
+    Complete pipeline: Iterative refinement + Style-based output generation + Policy check.
     
     Args:
         query: User's research query
         sources: Sources dictionary (topics, links, attachments)
         max_iterations: Number of refinement iterations
         style: Writing style dictionary (if None, will fetch random from DB)
+        enable_policy_check: Whether to run BSP policy alignment check (default: True)
     
     Returns:
-        Complete results including refined summary and styled output
+        Complete results including refined summary, styled output, and policy check
     """
     # Step 1: Iterative refinement
     print(f"\n{'='*70}")
@@ -1962,6 +1967,83 @@ async def process_with_iterative_refinement_and_style(
             if tavily_client:
                 await tavily_client.close()
     
+    # Step 7: BSP Policy Alignment Check
+    policy_check_result = None
+    if enable_policy_check and styled_result.get("success"):
+        print(f"\n{'='*70}")
+        print("STEP 7: BSP POLICY ALIGNMENT CHECK")
+        print('='*70)
+        
+        try:
+            # Determine which version of the speech to check (prefer APA if available)
+            speech_to_check = (
+                apa_result.get("apa_output") if apa_result and apa_result.get("success")
+                else styled_result.get("styled_output", "")
+            )
+            
+            # Prepare speech metadata
+            speech_metadata = {
+                "topic": query,
+                "speaker": style.get("speaker") if style else "BSP Official",
+                "audience": style.get("audience_setting_classification") if style else "General audience",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "query": query
+            }
+            
+            # Run policy alignment check using Azure Agent
+            policy_check_result = await check_speech_policy_alignment(
+                speech_content=speech_to_check,
+                speech_metadata=speech_metadata
+            )
+            
+            if policy_check_result.get("success"):
+                print(f"\n✓ Policy alignment check complete")
+                print(f"  Compliance: {policy_check_result.get('overall_compliance').upper()}")
+                print(f"  Score: {policy_check_result.get('compliance_score'):.1%}")
+                
+                # Show violations summary
+                violations_count = policy_check_result.get('violations_count', 0)
+                if violations_count > 0:
+                    print(f"  Violations: {violations_count}")
+                    print(f"    Critical: {policy_check_result.get('critical_violations', 0)}")
+                    print(f"    High: {policy_check_result.get('high_violations', 0)}")
+                
+                # Show commendations
+                commendations = policy_check_result.get('commendations', [])
+                if commendations:
+                    print(f"  Commendations: {len(commendations)} positive findings")
+                
+                # Show circulars referenced
+                circulars = policy_check_result.get('circular_references', [])
+                if circulars:
+                    print(f"  BSP Circulars Referenced: {len(circulars)}")
+                    for i, circ in enumerate(circulars[:3], 1):
+                        print(f"    {i}. {circ}")
+                
+                # Show recommendation
+                if policy_check_result.get('requires_revision'):
+                    print(f"\n  ⚠️ RECOMMENDATION: REVISION REQUIRED")
+                else:
+                    print(f"\n  ✅ RECOMMENDATION: APPROVED FOR USE")
+            else:
+                print(f"✗ Policy check failed: {policy_check_result.get('error', 'Unknown')}")
+                
+        except Exception as e:
+            print(f"✗ Policy alignment check failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            policy_check_result = {
+                "success": False,
+                "error": str(e),
+                "overall_compliance": "error",
+                "requires_revision": True
+            }
+    elif not enable_policy_check:
+        print(f"\n{'='*70}")
+        print("STEP 7: BSP POLICY ALIGNMENT CHECK - SKIPPED")
+        print('='*70)
+        print("  (Set enable_policy_check=True to enable)")
+    
     # Combine results
     complete_results = {
         **refinement_results,
@@ -1969,6 +2051,7 @@ async def process_with_iterative_refinement_and_style(
         "styled_output_apa": apa_result,
         "citation_verification": verification_result,
         "plagiarism_analysis": plagiarism_result,
+        "policy_check": policy_check_result,
         "style_used": {
             "name": style.get("name", "None") if style else "None",
             "speaker": style.get("speaker", "None") if style else "None",

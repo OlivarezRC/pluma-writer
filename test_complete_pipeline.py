@@ -19,12 +19,17 @@ async def test_complete_pipeline():
     print("Iterative Refinement → Style-Based Output Generation")
     print("=" * 70)
     
-    user_query = "What are transformer neural networks and their key innovations?"
+    user_query = "Use of AI models for financial portfolio management and risk predictions"
     
     user_sources = {
-        "topics": "transformer neural networks",
+        "topics": "AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning",
         "links": [
-            "https://arxiv.org/abs/1706.03762"
+            "https://arxiv.org/abs/2106.03072",  # Deep Learning for Portfolio Optimization
+            "https://arxiv.org/abs/2012.10377",  # Machine Learning in Finance
+            "https://www.sciencedirect.com/science/article/abs/pii/S0957417421006448",  # AI risk management
+            "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3420952",  # Deep Portfolio Theory
+            "https://www.bis.org/publ/work1022.htm",  # BIS - AI in finance
+            "https://www.imf.org/en/Publications/fintech-notes/Issues/2021/10/01/Fintech-and-Financial-Services-Initial-Considerations-464925"  # IMF on Fintech
         ],
         "attachments": []
     }
@@ -126,6 +131,7 @@ async def test_complete_pipeline():
             "styled_output_apa": results.get('styled_output_apa', {}),
             "citation_verification": results.get('citation_verification', {}),
             "plagiarism_analysis": results.get('plagiarism_analysis', {}),
+            "policy_check": results.get('policy_check', {}),
             "final_summary": results['final_summary']
         }
         
@@ -298,6 +304,60 @@ async def test_complete_pipeline():
                 print(f"\n{'─'*70}")
                 print("Plagiarism Analysis Results:")
                 print(f"  ✗ Analysis failed: {plagiarism_result.get('error', 'Unknown')}")
+            
+            # Display BSP Policy Alignment results
+            policy_result = results.get('policy_check')
+            if policy_result and policy_result.get('success'):
+                print(f"\n{'─'*70}")
+                print("BSP Policy Alignment Results:")
+                print(f"  • Overall compliance: {policy_result.get('overall_compliance').upper()}")
+                print(f"  • Compliance score: {policy_result.get('compliance_score'):.1%}")
+                
+                violations_count = policy_result.get('violations_count', 0)
+                if violations_count > 0:
+                    print(f"  • Total violations: {violations_count}")
+                    print(f"    🔴 Critical: {policy_result.get('critical_violations', 0)}")
+                    print(f"    🟠 High: {policy_result.get('high_violations', 0)}")
+                    print(f"    🟡 Medium/Low: {violations_count - policy_result.get('critical_violations', 0) - policy_result.get('high_violations', 0)}")
+                    
+                    # Show sample violations
+                    violations = policy_result.get('violations', [])
+                    if violations:
+                        print(f"\n  Sample violations:")
+                        for v in violations[:2]:  # Show first 2
+                            print(f"    [{v['severity'].upper()}] {v['category']}")
+                            print(f"      • {v['issue'][:80]}...")
+                            print(f"      • Circular: {v.get('circular_reference', 'N/A')}")
+                else:
+                    print(f"  ✓ No policy violations detected")
+                
+                # Show commendations
+                commendations = policy_result.get('commendations', [])
+                if commendations:
+                    print(f"  • Commendations: {len(commendations)} positive findings")
+                
+                # Show BSP circulars referenced
+                circulars = policy_result.get('circular_references', [])
+                if circulars:
+                    print(f"  • BSP Circulars Referenced: {len(circulars)}")
+                    for i, circ in enumerate(circulars[:3], 1):
+                        print(f"    {i}. {circ}")
+                    if len(circulars) > 3:
+                        print(f"    ... and {len(circulars) - 3} more")
+                
+                # Final recommendation
+                if policy_result.get('requires_revision'):
+                    print(f"\n  ⚠️  RECOMMENDATION: REVISION REQUIRED BEFORE PUBLICATION")
+                else:
+                    print(f"\n  ✅ RECOMMENDATION: APPROVED FOR USE")
+            elif policy_result and not policy_result.get('success'):
+                print(f"\n{'─'*70}")
+                print("BSP Policy Alignment Results:")
+                print(f"  ✗ Policy check failed: {policy_result.get('error', 'Unknown')}")
+            else:
+                print(f"\n{'─'*70}")
+                print("BSP Policy Alignment Results:")
+                print(f"  ⊘ Policy check was skipped or not configured")
         
         print("\n" + "=" * 70)
         print("✓ PIPELINE COMPLETED SUCCESSFULLY")

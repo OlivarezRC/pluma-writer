@@ -1,48 +1,60 @@
-Query: What are transformer neural networks and their key innovations?
+Query: Use of AI models for financial portfolio management and risk predictions
 
 Style: None
-Speaker: Benjamin E. Diokno
-Audience: PUBLIC_REGIONAL
+Speaker: Eli M. Remolona Jr.
+Audience: INTERNATIONAL_OFFICIAL
 
 ======================================================================
 STYLED OUTPUT (APA FORMAT)
 ======================================================================
 
-Good afternoon and welcome to our discussion on transformer neural networks and their key innovations.
+Good morning, ladies and gentlemen.
 
-Transformers are deep learning architectures that changed how we process sequences by using attention mechanisms, removing the need for recurrence or convolution (Vaswani et al., 2017; Ashish Vaswani et al., 2017). The original design used an encoder-decoder structure with multi-head self-attention to enable parallel computation and strong sequence modeling (Vaswani et al., 2017; Ashish Vaswani et al., 2017). It reached state-of-the-art machine translation results of 28.4 BLEU for English-German and 41.8 BLEU for English-French, while cutting training time to 3.5 days on 8 GPUs (Ashish Vaswani et al., 2017). The same design also adapted well to constituency parsing, showing its generalizability across tasks (Ashish Vaswani et al., 2017).
+It is my pleasure to welcome our international colleagues to this session.
 
-In recent years, scaling has brought new gains. Mixture-of-Experts architectures such as Switch Transformer use 1.6 trillion parameters spread across 2048 specialized experts to outperform dense models with 170B parameters (Medium, n.d.; r/MachineLearning, n.d.). Distributed deployment now uses serverless computing and predictive routing to optimize resources (arXiv, 2025). Architectural refinements also help maintain balanced performance as models reach trillion-parameter scales (LinkedIn, n.d.).
+We thank our hosts and partner institutions for bringing us together today.
 
-Advances also pair transformers with complementary components to improve efficiency and reach. Some combine transformers with convolutional layers to inject spatial bias and strengthen local feature processing (Boreal Times, n.d.). Others integrate State-Space Models to enable linear-time sequence handling (Boreal Times, n.d.). There are also neuro-symbolic integrations that blend pattern recognition with structured reasoning (Boreal Times, n.d.). These hybrids are effective in vision tasks such as HAT and MambaVision, in medical imaging via UTNet, and in point cloud processing (Boreal Times, n.d.), addressing computational intensity and broadening applicability at the same time (Boreal Times, n.d.).
+Our focus is the use of AI models for portfolio management and risk prediction.
 
-Frontier work explores quantum-inspired and quantum-enhanced directions. One line models attention as quantum field interactions that include spacetime dynamics (Medium, n.d.). Another uses parameterized quantum circuits, including QKV-only mappings and Quantum Pairwise Attention (arXiv, n.d.). There are also NN-QFT frameworks that reveal correlations between transformer operations and quantum field theory (arXiv, 2026). Together, these efforts offer new ways to understand context propagation and to build hybrid quantum-classical systems (arXiv, 2026).
+Modern AI and machine learning systems adapt to real-time market conditions and integrate behavioral economics principles like prospect theory to model investor decisions more realistically (PeakPotentia, n.d.; Madison Proceedings, n.d.). These systems address cognitive biases and emotional factors that classical models often overlook (Madison Proceedings, n.d.). In empirical studies, they achieve 15.7 percent higher Sharpe ratios and 12.4 percent greater returns than traditional benchmarks (pm-research.com, 2024).
 
-Before I close, let me underline the direction we see. The evolution of this architecture points to task-optimized systems that balance parameter growth, computational efficiency, and cross-modal capabilities through strategic hybridization of components (Boreal Times, n.d.; Emergent Mind, n.d.).
+Reinforcement learning architectures are impactful in this space, with frameworks such as RL-APM using DDPG agents to process OHLCV data and technical indicators for multi-asset management (pm-research.com, 2024). Models including A2C, PPO, and DDPG optimize asset weights through Sharpe ratio maximization across both crypto and traditional portfolios (pm-research.com, 2024). BBAPT frameworks incorporate investor biases through adjusted reward functions (Nature, n.d.). Despite implementation challenges in fintech applications (pm-research.com, 2024), these systems demonstrate improved scalability and risk-aware optimization (pm-research.com, 2024).
 
-Before I end, allow me to thank everyone for joining this session and for your commitment to shared learning. These innovations matter because they open paths to more capable, efficient, and adaptable models that can serve many communities and applications. Again, good afternoon and thank you all for coming. Maraming salamat at mabuhay!
+For risk prediction, Bayesian semiparametric models analyze multiple related multi-state processes through joint random effects on transition rates (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Gaussian Graphical Models identify risk clusters in financial systems (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Deep learning architectures such as RNNs and LSTMs enhance predictive accuracy by capturing nonlinear relationships and temporal dependencies in volatile markets (ResearchGate, n.d.). Explainable AI methods such as SHAP and LIME address interpretability challenges while supporting regulatory compliance in high-stakes settings (OptionOneTech, n.d.).
+
+Natural language processing strengthens risk assessment by mining central bank communications, where narrative information from monetary policy minutes impacts all analyzed market yields (Melo et al., 2022). Topics related to domestic demand and inflation expectations are particularly influential (Melo et al., 2022). LDA analysis shows that these narrative elements have greater market impact than numerical forecasts in inflation reports (Melo et al., 2022). Publication lags likely reduce the effectiveness of these reports (Melo et al., 2022).
+
+The integration of these AI techniques enables real-time analysis of complex market interactions (Karlsruhe Institute of Technology, n.d.; ResearchGate, n.d.). Probabilistic modeling also extends to innovation pathway analysis in R&D allocation (YARIME Masaru, n.d.). Flexible random effect distributions in Bayesian frameworks account for clustering and outliers in financial risk modeling (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Semiparametric approaches maintain adaptability to non-stationary market conditions (Andrea Cremaschi et al., 2021). Taken together, these advances show AI’s capacity to improve risk-adjusted returns and decision-making transparency in modern finance (ResearchGate, n.d.; ACM Digital Library, n.d.).
+
+In conclusion, the work before us can guide better choices, clearer communication, and stronger collaboration across markets and disciplines.
+
+Thank you and good morning.
 
 ======================================================================
 REFERENCES
 ======================================================================
 
-Ashish Vaswani et al. (2017). Attention Is All You Need. arXiv. https://arxiv.org/abs/1706.03762
+ACM Digital Library (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Explainable AI for Stock Price Prediction. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., & Polosukhin, I. (2017). Attention Is All You Need. arXiv. https://arxiv.org/abs/1706.03762
+Andrea Cremaschi et al. (2021). [2106.03072] Seemingly Unrelated Multi-State processes: a Bayesian semiparametric approach. arXiv. https://arxiv.org/abs/2106.03072
 
-Boreal Times (n.d.). transformer neural networks. Boreal Times. Retrieved from Deep Research: transformer neural networks
+Cremaschi, A., Argiento, R., Iorio, M. D., Shirong, C., Chong, Y. S., Meaney, M. J., & Kee, M. Z. L. (2021). [2106.03072] Seemingly Unrelated Multi-State processes: a Bayesian semiparametric approach. arXiv. https://arxiv.org/abs/2106.03072
 
-Emergent Mind (n.d.). transformer neural networks. Task-Optimised Neural Networks. Retrieved from Deep Research: transformer neural networks
+Karlsruhe Institute of Technology (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. KIT. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-LinkedIn (n.d.). transformer neural networks. LinkedIn. Retrieved from Deep Research: transformer neural networks
+Melo, L. F., Ospina, J. J., & Parra-Polania, J. A. (2022). Effects of Banco de la Republica's communication on the yield curve. BIS Working Papers. https://www.bis.org/publ/work1022.htm
 
-Medium (n.d.). transformer neural networks. Medium. Retrieved from Deep Research: transformer neural networks
+Madison Proceedings (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Madison Proceedings. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-arXiv (2025). transformer neural networks. arXiv. Deep Research: transformer neural networks
+Nature (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Journal of Behavioral Finance. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-arXiv (2026). transformer neural networks. Neural Network Quantum Field Theory from Transformer Architectures. Deep Research: transformer neural networks
+OptionOneTech (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. The Promise of Explainable AI (XAI) in Portfolio Management. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-arXiv (n.d.). transformer neural networks. arXiv. Retrieved from Deep Research: transformer neural networks
+PeakPotentia (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Medium. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-r/MachineLearning (n.d.). transformer neural networks. Reddit. Retrieved from Deep Research: transformer neural networks
+ResearchGate (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Deep learning model-driven financial risk prediction and analysis. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+
+YARIME Masaru (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Division of Public Policy, The University of Tokyo. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+
+pm-research.com (2024). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Journal of Portfolio Management. Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
