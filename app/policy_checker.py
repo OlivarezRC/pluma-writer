@@ -14,6 +14,9 @@ from datetime import datetime
 import aiohttp
 import msal
 
+# Import policy compliance enum
+from app.pipeline_enhancements import PolicyComplianceLevel
+
 
 @dataclass
 class PolicyViolation:
@@ -38,6 +41,7 @@ class PolicyCheckResult:
     circular_references: List[str]  # BSP circulars referenced
     requires_revision: bool
     timestamp: str
+    compliance_level: Optional['PolicyComplianceLevel'] = None  # Strict enum classification
 
 
 class AzurePolicyAgentClient:
@@ -478,7 +482,8 @@ class PolicyChecker:
             r'Rating[:\s]+([A-Za-z\s]+?)(?:\n|$)'
         ]
         
-        overall_compliance = "unknown"
+        # IMPROVEMENT #6: Default to NEEDS_REVISION (not unknown) for strict enum
+        overall_compliance = "needs_revision"  # Changed from "unknown"
         for pattern in compliance_patterns:
             match = re.search(pattern, response, re.IGNORECASE)
             if match:
@@ -522,6 +527,12 @@ class PolicyChecker:
             "major revision" in response.lower()
         )
         
+        # Map to strict compliance enum
+        compliance_level = PolicyComplianceLevel.from_agent_response(
+            overall_compliance, 
+            requires_revision
+        )
+        
         return PolicyCheckResult(
             overall_compliance=overall_compliance,
             compliance_score=compliance_score,
@@ -530,7 +541,8 @@ class PolicyChecker:
             agent_analysis=response,
             circular_references=circular_refs,
             requires_revision=requires_revision,
-            timestamp=datetime.now().isoformat()
+            timestamp=datetime.now().isoformat(),
+            compliance_level=compliance_level  # Add enum field
         )
     
     def _extract_violations(self, response: str) -> List[PolicyViolation]:

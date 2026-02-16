@@ -1,14 +1,208 @@
 #!/usr/bin/env python3
 """
 Test script for complete pipeline: Iterative Refinement + Style-based Output
+
+Enhanced with 6 architectural improvements:
+1. Claim-based style generation (prevents style drift)
+2. Cumulative evidence store (prevents evidence loss)
+3. Tight citation discipline (1-2 IDs per sentence)
+4. Sentence-level verification (more precise)
+5. Boilerplate filtering in plagiarism check
+6. Strict policy compliance enum (no UNKNOWN)
 """
 import asyncio
 import json
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from app.writer_main import process_with_iterative_refinement_and_style
+
+
+def validate_citation_discipline(text: str) -> dict:
+    """
+    Improvement #3: Validate tight citation discipline (1-2 IDs per sentence)
+    """
+    sentences = re.split(r'[.!?]+\s+', text)
+    
+    stats = {
+        'total_sentences': len(sentences),
+        'sentences_with_citations': 0,
+        'citation_violations': [],  # More than 2 IDs in one sentence
+        'max_ids_per_sentence': 0,
+        'avg_ids_per_sentence': 0,
+        'disciplined': True
+    }
+    
+    total_ids = 0
+    
+    for i, sentence in enumerate(sentences, 1):
+        citations = re.findall(r'\[E\d+(?:,E\d+)*\]', sentence)
+        if citations:
+            stats['sentences_with_citations'] += 1
+            
+            # Count unique IDs in this sentence
+            ids_in_sentence = set()
+            for citation in citations:
+                ids = re.findall(r'E\d+', citation)
+                ids_in_sentence.update(ids)
+            
+            id_count = len(ids_in_sentence)
+            total_ids += id_count
+            stats['max_ids_per_sentence'] = max(stats['max_ids_per_sentence'], id_count)
+            
+            # Violation: more than 2 IDs per sentence (citation spraying)
+            if id_count > 2:
+                stats['citation_violations'].append({
+                    'sentence_num': i,
+                    'id_count': id_count,
+                    'ids': list(ids_in_sentence),
+                    'preview': sentence[:100] + '...' if len(sentence) > 100 else sentence
+                })
+                stats['disciplined'] = False
+    
+    if stats['sentences_with_citations'] > 0:
+        stats['avg_ids_per_sentence'] = total_ids / stats['sentences_with_citations']
+    
+    return stats
+
+
+def validate_sentence_level_verification(verification_result: dict) -> dict:
+    """
+    Improvement #4: Analyze sentence-level verification instead of segment-level
+    """
+    if not verification_result:
+        return {'enabled': False}
+    
+    segments = verification_result.get('segments', [])
+    
+    # Check if we're using sentence-level (flag is at root level, not segment level)
+    sentence_level = verification_result.get('is_sentence_level', False)
+    
+    return {
+        'enabled': True,
+        'is_sentence_level': sentence_level,
+        'total_segments': len(segments),
+        'verified_count': sum(1 for s in segments if s.get('verified') == 'Yes'),
+        'unverified_count': sum(1 for s in segments if s.get('verified') != 'Yes'),
+        'verification_rate': verification_result.get('verification_rate', '0%')
+    }
+
+
+def validate_boilerplate_filtering(plagiarism_result: dict) -> dict:
+    """
+    Improvement #5: Check if boilerplate greetings are filtered from plagiarism check
+    """
+    if not plagiarism_result or not plagiarism_result.get('success'):
+        return {'enabled': False}
+    
+    stats = plagiarism_result.get('statistics', {})
+    
+    # Check the new boilerplate_filtered stat
+    boilerplate_filtered = stats.get('boilerplate_filtered', 0)
+    total_chunks = stats.get('total_chunks', 0)
+    
+    return {
+        'enabled': True,
+        'boilerplate_patterns_filtered': boilerplate_filtered,
+        'total_chunks_analyzed': total_chunks,
+        'filtering_active': boilerplate_filtered > 0
+    }
+
+
+def validate_policy_compliance_enum(policy_result: dict) -> dict:
+    """
+    Improvement #6: Ensure policy compliance returns strict enum (not UNKNOWN)
+    """
+    if not policy_result or not policy_result.get('success'):
+        return {'enabled': False}
+    
+    overall_compliance = policy_result.get('overall_compliance', '').upper()
+    
+    # Valid strict enums
+    valid_enums = ['COMPLIANT', 'NEEDS_REVISION', 'NON_COMPLIANT', 'MINOR_ISSUES', 'MAJOR_ISSUES']
+    
+    return {
+        'enabled': True,
+        'overall_compliance': overall_compliance,
+        'is_strict_enum': overall_compliance in valid_enums,
+        'is_unknown': overall_compliance == 'UNKNOWN',
+        'requires_revision': policy_result.get('requires_revision', False),
+        'compliance_score': policy_result.get('compliance_score', 0.0)
+    }
+
+
+def validate_evidence_stability(iterations: list) -> dict:
+    """
+    Improvement #2: Check if evidence extraction is cumulative (no loss across iterations)
+    """
+    if not iterations:
+        return {'enabled': False}
+    
+    evidence_counts = []
+    evidence_ids_per_iter = []
+    
+    for iteration in iterations:
+        count = iteration.get('cumulative_evidence_count', 0)
+        evidence_counts.append(count)
+        
+        # Extract evidence IDs
+        evidence_store = iteration.get('results', {}).get('cumulative_evidence_store', [])
+        ids = {ev.get('id') for ev in evidence_store if ev.get('id')}
+        evidence_ids_per_iter.append(ids)
+    
+    # Check for evidence loss (decreasing count)
+    evidence_lost = any(
+        evidence_counts[i] < evidence_counts[i-1] 
+        for i in range(1, len(evidence_counts))
+    )
+    
+    # Check for ID loss
+    ids_lost = []
+    for i in range(1, len(evidence_ids_per_iter)):
+        prev_ids = evidence_ids_per_iter[i-1]
+        curr_ids = evidence_ids_per_iter[i]
+        lost = prev_ids - curr_ids
+        if lost:
+            ids_lost.append({
+                'iteration': i + 1,
+                'lost_ids': list(lost)
+            })
+    
+    return {
+        'enabled': True,
+        'evidence_counts': evidence_counts,
+        'is_cumulative': not evidence_lost and not ids_lost,
+        'evidence_lost': evidence_lost,
+        'ids_lost': ids_lost
+    }
+
+
+def validate_claim_outline(results: dict) -> dict:
+    """
+    Improvement #1: Check if style generation uses claim outlines instead of freeform prose
+    """
+    styled_output = results.get('styled_output', {})
+    
+    # Check if claim outline was used in the process
+    has_claim_outline = styled_output.get('claim_outline_used', False)
+    claim_count = styled_output.get('claim_count', 0)
+    
+    # Look for evidence of structured claims
+    styled_text = styled_output.get('styled_output', '')
+    
+    # Parse to see if claims are well-attributed (1-2 IDs per claim)
+    sentences = re.split(r'[.!?]+\s+', styled_text)
+    factual_sentences = [s for s in sentences if re.search(r'\[E\d+', s)]
+    
+    return {
+        'enabled': True,
+        'claim_outline_used': has_claim_outline,
+        'claim_count': claim_count,
+        'factual_sentences': len(factual_sentences),
+        'total_sentences': len(sentences)
+    }
 
 
 async def test_complete_pipeline():
@@ -17,6 +211,15 @@ async def test_complete_pipeline():
     print("=" * 70)
     print("COMPLETE PIPELINE TEST")
     print("Iterative Refinement → Style-Based Output Generation")
+    print("=" * 70)
+    
+    print("\n🔧 ARCHITECTURAL IMPROVEMENTS ENABLED:")
+    print("  1. Evidence Stability: Cumulative store prevents loss")
+    print("  2. Claim-Based Style: Prevents style drift & hallucinations")
+    print("  3. Citation Discipline: Max 1-2 IDs per sentence")
+    print("  4. Sentence-Level Verification: More precise than segments")
+    print("  5. Boilerplate Filtering: Skip greetings in plagiarism check")
+    print("  6. Strict Policy Enum: COMPLIANT/NEEDS_REVISION/NON_COMPLIANT")
     print("=" * 70)
     
     user_query = "Use of AI models for financial portfolio management and risk predictions"
@@ -60,7 +263,117 @@ async def test_complete_pipeline():
         print(f"  • Final evidence count: {results['final_evidence_count']}")
         print(f"  • Final summary length: {len(results['final_summary'].get('summary', ''))} chars")
         
-        # Style information
+        # === NEW: ARCHITECTURAL IMPROVEMENTS VALIDATION ===
+        print(f"\n" + "=" * 70)
+        print("🔧 ARCHITECTURAL IMPROVEMENTS VALIDATION")
+        print("=" * 70)
+        
+        # Improvement #2: Evidence Stability
+        print(f"\n1️⃣  EVIDENCE STABILITY (Cumulative Store):")
+        evidence_stability = validate_evidence_stability(results['iterations'])
+        if evidence_stability['enabled']:
+            print(f"    Evidence counts: {' → '.join(map(str, evidence_stability['evidence_counts']))}")
+            if evidence_stability['is_cumulative']:
+                print(f"    ✅ Evidence is cumulative (no loss across iterations)")
+            else:
+                print(f"    ❌ Evidence loss detected!")
+                if evidence_stability['ids_lost']:
+                    for loss in evidence_stability['ids_lost']:
+                        print(f"       Iteration {loss['iteration']}: Lost {len(loss['lost_ids'])} IDs")
+        
+        # Improvement #1: Claim Outline
+        print(f"\n2️⃣  CLAIM-BASED STYLE (Prevents Style Drift):")
+        claim_validation = validate_claim_outline(results)
+        if claim_validation['enabled']:
+            if claim_validation['claim_outline_used']:
+                print(f"    ✅ Claim outline used: {claim_validation['claim_count']} claims")
+                print(f"    Factual sentences: {claim_validation['factual_sentences']}/{claim_validation['total_sentences']}")
+            else:
+                print(f"    ⚠️  Freeform prose used (may cause style drift)")
+        
+        # Improvement #3: Citation Discipline
+        styled_result = results.get('styled_output', {})
+        citation_discipline = {}
+        if styled_result.get('success'):
+            print(f"\n3️⃣  CITATION DISCIPLINE (1-2 IDs per sentence):")
+            styled_text = styled_result.get('styled_output', '')
+            citation_discipline = validate_citation_discipline(styled_text)
+            print(f"    Total sentences: {citation_discipline['total_sentences']}")
+            print(f"    Sentences with citations: {citation_discipline['sentences_with_citations']}")
+            print(f"    Avg IDs per sentence: {citation_discipline['avg_ids_per_sentence']:.2f}")
+            print(f"    Max IDs per sentence: {citation_discipline['max_ids_per_sentence']}")
+            
+            if citation_discipline['disciplined']:
+                print(f"    ✅ Citation discipline maintained (≤2 IDs/sentence)")
+            else:
+                print(f"    ⚠️  Citation violations detected: {len(citation_discipline['citation_violations'])}")
+                for violation in citation_discipline['citation_violations'][:2]:
+                    print(f"       Sentence {violation['sentence_num']}: {violation['id_count']} IDs (citation spraying)")
+        
+        # Improvement #4: Sentence-Level Verification
+        print(f"\n4️⃣  SENTENCE-LEVEL VERIFICATION:")
+        verification_result = results.get('citation_verification', {})
+        sentence_verify = validate_sentence_level_verification(verification_result)
+        if sentence_verify['enabled']:
+            if sentence_verify['is_sentence_level']:
+                print(f"    ✅ Sentence-level verification active")
+            else:
+                print(f"    ⚠️  Segment-level verification (less precise)")
+            print(f"    Verified: {sentence_verify['verified_count']}/{sentence_verify['total_segments']}")
+            print(f"    Verification rate: {sentence_verify['verification_rate']}")
+        
+        # Improvement #5: Boilerplate Filtering
+        print(f"\n5️⃣  BOILERPLATE FILTERING (Plagiarism Check):")
+        plagiarism_result = results.get('plagiarism_analysis', {})
+        boilerplate = validate_boilerplate_filtering(plagiarism_result)
+        if boilerplate['enabled']:
+            if boilerplate['filtering_active']:
+                print(f"    ✅ Boilerplate filtering active")
+                print(f"    Filtered: {boilerplate['boilerplate_patterns_filtered']} chunks")
+                print(f"    Total analyzed: {boilerplate['total_chunks_analyzed']}")
+            else:
+                print(f"    ⚠️  No boilerplate filtering detected")
+                print(f"    Total analyzed: {boilerplate['total_chunks_analyzed']}")
+        
+        # Improvement #6: Strict Policy Enum
+        print(f"\n6️⃣  STRICT POLICY COMPLIANCE ENUM:")
+        policy_result = results.get('policy_check', {})
+        policy_enum = validate_policy_compliance_enum(policy_result)
+        if policy_enum['enabled']:
+            print(f"    Compliance status: {policy_enum['overall_compliance']}")
+            if policy_enum['is_strict_enum']:
+                print(f"    ✅ Strict enum used (COMPLIANT/NEEDS_REVISION/NON_COMPLIANT)")
+                print(f"    Score: {policy_enum['compliance_score']:.1%}")
+                print(f"    Requires revision: {'Yes' if policy_enum['requires_revision'] else 'No'}")
+            elif policy_enum['is_unknown']:
+                print(f"    ❌ UNKNOWN status detected (should require human review)")
+            else:
+                print(f"    ⚠️  Non-standard enum: {policy_enum['overall_compliance']}")
+        
+        print(f"\n" + "=" * 70)
+        
+        # === CALCULATE IMPROVEMENT SCORECARD (before saving) ===
+        score = 0
+        max_score = 6
+        
+        # Score each improvement silently (will display later)
+        if evidence_stability.get('is_cumulative'):
+            score += 1
+        if claim_validation.get('claim_outline_used'):
+            score += 1
+        if citation_discipline.get('disciplined'):
+            score += 1
+        if sentence_verify.get('is_sentence_level'):
+            score += 1
+        if boilerplate.get('filtering_active'):
+            score += 1
+        if policy_enum.get('is_strict_enum') and not policy_enum.get('is_unknown'):
+            score += 1
+        
+        grade_percent = (score / max_score) * 100
+        grade_letter = 'A+' if grade_percent >= 95 else 'A' if grade_percent >= 90 else 'B+' if grade_percent >= 85 else 'B' if grade_percent >= 80 else 'C+'
+        
+        # Continue with style information display
         print(f"\n✍️ WRITING STYLE APPLIED:")
         style_info = results.get('style_used', {})
         print(f"  • Style name: {style_info.get('name', 'None')}")
@@ -132,7 +445,19 @@ async def test_complete_pipeline():
             "citation_verification": results.get('citation_verification', {}),
             "plagiarism_analysis": results.get('plagiarism_analysis', {}),
             "policy_check": results.get('policy_check', {}),
-            "final_summary": results['final_summary']
+            "final_summary": results['final_summary'],
+            # NEW: Add improvement metrics
+            "improvement_metrics": {
+                "evidence_stability": evidence_stability,
+                "claim_outline": claim_validation,
+                "citation_discipline": citation_discipline,
+                "sentence_verification": sentence_verify,
+                "boilerplate_filtering": boilerplate,
+                "policy_enum": policy_enum,
+                "overall_score": f"{score}/{max_score}",
+                "grade_percent": grade_percent,
+                "grade_letter": grade_letter
+            }
         }
         
         with open('complete_pipeline_output.json', 'w') as f:
@@ -358,6 +683,48 @@ async def test_complete_pipeline():
                 print(f"\n{'─'*70}")
                 print("BSP Policy Alignment Results:")
                 print(f"  ⊘ Policy check was skipped or not configured")
+        
+        # === DISPLAY IMPROVEMENTS SCORECARD (already calculated) ===
+        print("\n" + "=" * 70)
+        print("📊 IMPROVEMENTS SCORECARD")
+        print("=" * 70)
+        
+        # Display scores using already-calculated values
+        if evidence_stability.get('is_cumulative'):
+            print("✅ [1/1] Evidence Stability: Cumulative store working")
+        else:
+            print("❌ [0/1] Evidence Stability: Evidence loss detected")
+        
+        if claim_validation.get('claim_outline_used'):
+            print("✅ [1/1] Claim-Based Style: Active")
+        else:
+            print("⚠️  [0/1] Claim-Based Style: Not active")
+        
+        if citation_discipline.get('disciplined'):
+            print("✅ [1/1] Citation Discipline: Maintained (≤2 IDs/sentence)")
+        else:
+            print(f"⚠️  [0/1] Citation Discipline: {len(citation_discipline.get('citation_violations', []))} violations")
+        
+        if sentence_verify.get('is_sentence_level'):
+            print("✅ [1/1] Sentence-Level Verification: Active")
+        else:
+            print("⚠️  [0/1] Sentence-Level Verification: Using segment-level")
+        
+        if boilerplate.get('filtering_active'):
+            print("✅ [1/1] Boilerplate Filtering: Active")
+        else:
+            print("⚠️  [0/1] Boilerplate Filtering: Not detected")
+        
+        if policy_enum.get('is_strict_enum') and not policy_enum.get('is_unknown'):
+            print("✅ [1/1] Strict Policy Enum: Enforced")
+        elif policy_enum.get('is_unknown'):
+            print("❌ [0/1] Strict Policy Enum: UNKNOWN status found")
+        else:
+            print("⚠️  [0/1] Strict Policy Enum: Non-standard enum")
+        
+        print(f"\n{'─'*70}")
+        print(f"OVERALL GRADE: {score}/{max_score} improvements active ({grade_percent:.0f}%) - {grade_letter}")
+        print(f"{'─'*70}")
         
         print("\n" + "=" * 70)
         print("✓ PIPELINE COMPLETED SUCCESSFULLY")

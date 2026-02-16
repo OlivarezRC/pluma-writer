@@ -1090,7 +1090,87 @@ def _extract_rulebook_text(rulebook: Dict[str, Any]) -> str:
         return str(rulebook)
 
 
-async def generate_styled_output(summary: str, query: str, style: Dict[str, Any], evidence_store: List[Dict[str, Any]] = None, max_output_length: int = 16000) -> Dict[str, Any]:
+def enforce_citation_discipline(text: str, max_ids_per_sentence: int = 2) -> str:
+    """
+    IMPROVEMENT #3: Enforce citation discipline - max N evidence IDs per sentence.
+    
+    If a sentence has more than max_ids_per_sentence citations, keep only the first N.
+    This prevents "citation spraying" where models cite many IDs hoping one fits.
+    
+    Args:
+        text: Styled output text with citations
+        max_ids_per_sentence: Maximum evidence IDs allowed per sentence (default: 2)
+        
+    Returns:
+        Text with citation discipline enforced
+    """
+    # Split into sentences (preserve terminators)
+    # Pattern splits on .!? followed by space, so we need to add them back
+    parts = re.split(r'([.!?]+\s+)', text)
+    
+    corrected_parts = []
+    violations_fixed = 0
+    
+    for i in range(0, len(parts), 2):
+        if i >= len(parts):
+            break
+            
+        sentence = parts[i]
+        terminator = parts[i+1] if i+1 < len(parts) else ''
+        
+        # Find all citations in this sentence
+        citations = re.findall(r'\[E\d+(?:,E\d+)*\]', sentence)
+        
+        if not citations:
+            corrected_parts.append(sentence + terminator)
+            continue
+        
+        # Extract all unique evidence IDs from all citations in the sentence
+        all_ids = []
+        for citation in citations:
+            ids = re.findall(r'E\d+', citation)
+            all_ids.extend(ids)
+        
+        # Remove duplicates while preserving order
+        unique_ids = list(dict.fromkeys(all_ids))
+        
+        if len(unique_ids) <= max_ids_per_sentence:
+            # Already compliant
+            corrected_parts.append(sentence + terminator)
+        else:
+            # Violation: too many IDs
+            violations_fixed += 1
+            
+            # Keep only first max_ids_per_sentence IDs
+            kept_ids = unique_ids[:max_ids_per_sentence]
+            
+            # Replace all citations in this sentence with a single citation
+            corrected_sentence = sentence
+            for citation in citations:
+                corrected_sentence = corrected_sentence.replace(citation, '', 1)
+            
+            # Add the corrected citation (clean up extra spaces)
+            new_citation = f"[{','.join(kept_ids)}]"
+            corrected_sentence = corrected_sentence.strip() + " " + new_citation
+            
+            corrected_parts.append(corrected_sentence + terminator)
+    
+    if violations_fixed > 0:
+        print(f"  ⚠️  Fixed {violations_fixed} citation discipline violations (reduced to ≤{max_ids_per_sentence} IDs/sentence)")
+    else:
+        print(f"  ✓ Citation discipline already maintained (≤{max_ids_per_sentence} IDs/sentence)")
+    
+    return ''.join(corrected_parts)
+
+
+async def generate_styled_output(
+    summary: str, 
+    query: str, 
+    style: Dict[str, Any], 
+    evidence_store: List[Dict[str, Any]] = None, 
+    max_output_length: int = 16000,
+    use_claim_outline: bool = True  # IMPROVEMENT #1: Use claim outlines by default
+) -> Dict[str, Any]:
     """
     Generate final styled output with STRICT citation enforcement.
     Follows the same pattern as prompts.rewrite_content() but enforces [ENN] citations.
@@ -1101,6 +1181,7 @@ async def generate_styled_output(summary: str, query: str, style: Dict[str, Any]
         style: Writing style dictionary from Cosmos DB (can be None for default formatting)
         evidence_store: List of atomic evidence items for citation validation
         max_output_length: Maximum completion tokens for output (default: 16000 for GPT-5 reasoning)
+        use_claim_outline: If True, generate claim outline first to prevent style drift
     
     Returns:
         Dictionary with styled output, validation metrics, and metadata
@@ -1134,7 +1215,179 @@ async def generate_styled_output(summary: str, query: str, style: Dict[str, Any]
             allowed_ids = [e.get("id") for e in evidence_store if e.get("id")]
         allowed_ids_str = ", ".join(allowed_ids) if allowed_ids else "None available"
         
-        # Build the system prompt with STRICT citation rules
+        # IMPROVEMENT #1: Generate claim outline to prevent style drift
+        claim_outline_data = None
+        claim_count = 0
+        claim_outline = None
+        
+        print(f"[DEBUG] Claim outline parameters: use_claim_outline={use_claim_outline}, evidence_store_size={len(evidence_store) if evidence_store else 0}")
+        print(f"[DEBUG] Summary length for extraction: {len(summary)} chars")
+        
+        if use_claim_outline and evidence_store:
+            try:
+                print("[INFO] ✨ Generating claim outline to prevent style drift...")
+                print(f"[INFO] Evidence store has {len(evidence_store)} items")
+                
+                # Build evidence map
+                evidence_map = {e['id']: e for e in evidence_store if 'id' in e}
+                
+                # Create extraction prompt
+                extraction_prompt = f"""Extract atomic factual claims from this research summary. Each claim should be:
+
+1. **One clear factual statement** (not multiple facts combined)
+2. **Tied to 1-2 evidence IDs** (from the cited [ENN] references)
+3. **Classified by type**:
+   - "factual": Concrete fact, statistic, or research finding  
+   - "interpretation": Analysis or implication drawn from facts
+   - "transition": Logical connection (no citations needed)
+
+<SUMMARY>
+{summary[:3000]}  
+</SUMMARY>
+
+<TASK>
+Return a JSON array where each item has:
+- "claim_text": the atomic factual statement (one sentence)
+- "evidence_ids": array of 1-2 evidence IDs that support this claim (e.g., ["E1", "E5"])
+- "claim_type": "factual", "interpretation", or "transition"
+- "confidence": your confidence (0.0-1.0) that evidence supports this claim
+
+IMPORTANT RULES:
+- One fact per claim (don't combine multiple statistics)
+- Maximum 2 evidence IDs per claim
+- Only use evidence IDs that actually appear in the summary
+
+Return ONLY the JSON array (no markdown, no explanation).
+</TASK>
+
+JSON:"""
+                
+                # Call LLM to extract claims (GPT-5 needs more tokens for reasoning)
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "You are a precise claim extraction system. Return ONLY valid JSON array, no other text."},
+                        {"role": "user", "content": extraction_prompt}
+                    ],
+                    max_completion_tokens=8000  # GPT-5 uses lots of reasoning tokens, needs higher limit (default temp=1 only)
+                )
+                
+                # Check finish reason first
+                finish_reason = response.choices[0].finish_reason
+                print(f"[DEBUG] Finish reason: {finish_reason}")
+                
+                # Check token usage
+                if hasattr(response, 'usage') and response.usage:
+                    usage = response.usage
+                    print(f"[DEBUG] Token usage - Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}")
+                    if hasattr(usage, 'completion_tokens_details') and usage.completion_tokens_details:
+                        details = usage.completion_tokens_details
+                        if hasattr(details, 'reasoning_tokens') and details.reasoning_tokens:
+                            print(f"[DEBUG] Reasoning tokens: {details.reasoning_tokens}, Output tokens: {usage.completion_tokens - details.reasoning_tokens}")
+                
+                raw_content = response.choices[0].message.content
+                print(f"[DEBUG] Raw LLM response: {raw_content[:500] if raw_content else 'NONE'}")
+                
+                if not raw_content:
+                    error_msg = f"LLM returned empty response (finish_reason: {finish_reason})"
+                    if finish_reason == 'length':
+                        error_msg += " - Hit token limit, increase max_completion_tokens"
+                    raise ValueError(error_msg)
+                
+                content = raw_content.strip()
+                print(f"[DEBUG] After strip: {len(content)} chars")
+                
+                # IMPROVEMENT #1: Better JSON extraction handling
+                # Strip thinking tokens (both <think> and <thinking>)
+                if '<think>' in content or '<thinking>' in content:
+                    if '</think>' in content:
+                        content = content.split('</think>')[-1].strip()
+                    elif '</thinking>' in content:
+                        content = content.split('</thinking>')[-1].strip()
+                    print(f"[DEBUG] After thinking removal: {len(content)} chars")
+                
+                # Strip markdown code blocks
+                content = content.replace('```json', '').replace('```', '').strip()
+                print(f"[DEBUG] After markdown removal: {len(content)} chars")
+                
+                # Remove any leading/trailing text before/after JSON
+                # Extract JSON array (find first [ to last ])
+                start_idx = content.find('[')
+                end_idx = content.rfind(']')
+                print(f"[DEBUG] JSON array search: start={start_idx}, end={end_idx}")
+                
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    content = content[start_idx:end_idx+1]
+                    print(f"[DEBUG] Extracted array: {len(content)} chars, starts with: {content[:100]}")
+                else:
+                    # Try to find JSON object if no array
+                    start_idx = content.find('{')
+                    end_idx = content.rfind('}')
+                    print(f"[DEBUG] JSON object search: start={start_idx}, end={end_idx}")
+                    
+                    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                        # Wrap single object in array
+                        content = '[' + content[start_idx:end_idx+1] + ']'
+                        print(f"[DEBUG] Wrapped single object in array: {len(content)} chars")
+                    else:
+                        raise ValueError(f"No JSON found. Content length: {len(content)}, Raw: {raw_content[:500]}")
+                
+                if len(content) < 5:
+                    raise ValueError(f"Extracted JSON too short ({len(content)} chars): '{content}'")
+                
+                print(f"[DEBUG] About to parse JSON: {content[:200]}")
+                claims_data = json.loads(content)
+                
+                if not isinstance(claims_data, list):
+                    raise ValueError(f"Expected JSON array, got {type(claims_data).__name__}")
+                
+                # Filter to valid claims with evidence
+                claim_outline_data = []
+                for i, claim in enumerate(claims_data[:15], 1):  # Max 15 claims
+                    evidence_ids = claim.get('evidence_ids', [])
+                    valid_ids = [eid for eid in evidence_ids if eid in evidence_map]
+                    if len(valid_ids) > 2:
+                        valid_ids = valid_ids[:2]  # Max 2 IDs per claim
+                    
+                    if valid_ids or claim.get('claim_type') == 'transition':
+                        claim_outline_data.append({
+                            'claim_id': f"C{i}",
+                            'claim_text': claim.get('claim_text', ''),
+                            'evidence_ids': valid_ids,
+                            'claim_type': claim.get('claim_type', 'factual')
+                        })
+                
+                claim_count = len(claim_outline_data)
+                print(f"[SUCCESS] ✅ Extracted {claim_count} claims from summary")
+                print(f"[SUCCESS] ✅ Claim outline will be used for styling")
+                
+                # Create prompt text from claims
+                claim_prompt_lines = ["CLAIM OUTLINE (Rephrase ONLY these claims):", ""]
+                for claim in claim_outline_data:
+                    evidence_str = ", ".join(claim['evidence_ids'])
+                    claim_prompt_lines.append(f"{claim['claim_id']}. {claim['claim_text']}")
+                    if claim['evidence_ids']:
+                        claim_prompt_lines.append(f"   Evidence: [{evidence_str}]")
+                    claim_prompt_lines.append(f"   Type: {claim['claim_type']}")
+                    claim_prompt_lines.append("")
+                
+                claim_outline = "\n".join(claim_prompt_lines)
+                
+            except Exception as e:
+                print(f"[ERROR] ❌ Claim outline generation failed: {e}")
+                import traceback
+                print(f"[ERROR] Traceback:")
+                traceback.print_exc()
+                print(f"[INFO] Falling back to freeform prose styling")
+                claim_outline = None
+                claim_outline_data = None
+        else:
+            if not use_claim_outline:
+                print(f"[INFO] Claim outline disabled (use_claim_outline=False)")
+            elif not evidence_store:
+                print(f"[INFO] No evidence store available for claim outline generation")
+        
+        # Build the system prompt with STRICT citation rules and claim outline
         system_parts = [
             "You are an expert writer assistant. Rewrite the user input based on the following writing style, global rules, writing guidelines and writing example.\n",
             f"<writingStyle>{style_text}</writingStyle>\n",
@@ -1142,6 +1395,22 @@ async def generate_styled_output(summary: str, query: str, style: Dict[str, Any]
             f"<writingGuidelines>{guidelines}</writingGuidelines>\n",
             f"<writingExample>{example}</writingExample>\n",
             "Make sure to emulate the writing style, global rules, guidelines and example provided above.\n\n",
+        ]
+        
+        # Add claim outline instructions if available
+        if claim_outline and claim_outline_data:
+            system_parts.extend([
+                "CLAIM-BASED REWRITING MODE:\n",
+                "You are given a CLAIM OUTLINE below. You must:\n",
+                "1. Rephrase ONLY the claims provided (do not add new facts or methods)\n",
+                "2. Preserve all evidence citations exactly as shown\n",
+                "3. You may adjust wording for flow, but NOT add new factual content\n",
+                "4. Transitions must be non-factual (e.g., 'This suggests...', 'A key implication is...')\n",
+                "5. Do NOT introduce named methods, numbers, or entities not in the claim outline\n\n",
+                claim_outline + "\n\n"
+            ])
+        
+        system_parts.extend([
             "CRITICAL CITATION REQUIREMENTS:\n",
             "1. EVERY factual claim MUST end with [ENN] citation format (e.g., [E1] or [E2,E5])\n",
             "2. You may ONLY cite these evidence IDs: " + allowed_ids_str + "\n",
@@ -1150,7 +1419,7 @@ async def generate_styled_output(summary: str, query: str, style: Dict[str, Any]
             "5. If you rephrase a sentence, keep its citation intact\n",
             "6. Multiple claims in one sentence = multiple citations [E1,E3,E7]\n\n",
             f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
-        ]
+        ])
         
         system_prompt = "".join(system_parts)
         
@@ -1248,6 +1517,10 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
         if len(styled_output) > max_output_length:
             styled_output = styled_output[:max_output_length]
         
+        # IMPROVEMENT #5: Enforce citation discipline (max 2 IDs per sentence)
+        print("[INFO] Enforcing citation discipline (max 2 IDs/sentence)...")
+        styled_output = enforce_citation_discipline(styled_output, max_ids_per_sentence=2)
+        
         # Validate citations in styled output
         citation_pattern = r'\[E\d+(?:,E\d+)*\]'
         citations_found = re.findall(citation_pattern, styled_output)
@@ -1280,6 +1553,9 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             "unique_evidence_cited": cited_count,
             "citation_coverage": f"{coverage:.1f}%",
             "invalid_citations": invalid_citations,
+            # IMPROVEMENT #1: Track claim outline usage
+            "claim_outline_used": claim_outline_data is not None,
+            "claim_count": claim_count,
             "validation": {
                 "all_citations_valid": len(invalid_citations) == 0,
                 "cited_ids": sorted(list(cited_ids)),
@@ -1287,11 +1563,21 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             }
         }
         
+        # Debug: Confirm claim outline status being returned
+        print(f"[DEBUG] Returning styled_result with claim_outline_used={claim_outline_data is not None}, claim_count={claim_count}")
+        
+        return result
+        
     except Exception as e:
+        print(f"[ERROR] Style generation failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e),
-            "styled_output": summary  # Fallback to unstyled summary
+            "styled_output": summary,  # Fallback to unstyled summary
+            "claim_outline_used": False,
+            "claim_count": 0
         }
 
 
@@ -1542,7 +1828,8 @@ async def convert_styled_output_to_apa(
 async def verify_styled_citations(
     styled_output: str, 
     evidence_store: List[Dict[str, Any]],
-    azure_llm_client = None
+    azure_llm_client = None,
+    sentence_level: bool = True  # IMPROVEMENT #4: Enable sentence-level verification by default
 ) -> Dict[str, Any]:
     """
     Parse styled output by citations and verify each claim matches its cited evidence.
@@ -1551,6 +1838,7 @@ async def verify_styled_citations(
         styled_output: The styled text with citations like [E1] or [E1,E2]
         evidence_store: List of evidence dicts with id, claim, quote_span, etc.
         azure_llm_client: Optional Azure OpenAI client for verification
+        sentence_level: If True, verify at sentence level (more precise). If False, use segment level.
         
     Returns:
         {
@@ -1561,18 +1849,20 @@ async def verify_styled_citations(
                     "citations": ["E1", "E2"],
                     "cited_claims": ["claim text...", "claim text..."],
                     "verified": "Yes" | "No",
-                    "verification_reason": "..."
+                    "verification_reason": "...",
+                    "is_sentence_level": True|False
                 }
             ],
             "total_segments": 10,
             "verified_segments": 8,
             "unverified_segments": 2,
-            "verification_rate": "80.0%"
+            "verification_rate": "80.0%",
+            "is_sentence_level": True|False
         }
     """
     
     print("\n" + "="*70)
-    print("VERIFYING STYLED OUTPUT CITATIONS")
+    print(f"VERIFYING STYLED OUTPUT CITATIONS ({'SENTENCE-LEVEL' if sentence_level else 'SEGMENT-LEVEL'})")
     print("="*70)
     
     # Build evidence lookup dict
@@ -1584,52 +1874,103 @@ async def verify_styled_citations(
     
     print(f"Evidence store: {len(evidence_dict)} items")
     
-    # Split text into segments by citation patterns
-    # Pattern: text ending with [ENN] or [E1,E2,E3]
+    # IMPROVEMENT #4: Split text into segments
     citation_pattern = r'\[E\d+(?:,E\d+)*\]'
     
     segments = []
-    current_pos = 0
     segment_number = 0
     
-    # Find all citations and their positions
-    for match in re.finditer(citation_pattern, styled_output):
-        segment_number += 1
+    if sentence_level:
+        # Sentence-level verification: Split into sentences first, then check each
+        sentences = re.split(r'(?<=[.!?])\s+', styled_output)
         
-        # Extract text from last position to end of this citation
-        segment_end = match.end()
-        segment_text = styled_output[current_pos:segment_end].strip()
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # Check if this sentence has citations
+            citations_in_sentence = re.findall(citation_pattern, sentence)
+            if not citations_in_sentence:
+                # Skip sentences without citations (non-factual content)
+                continue
+            
+            segment_number += 1
+            
+            # Extract all citation IDs from this sentence
+            citation_ids = []
+            for citation_match in citations_in_sentence:
+                citation_ids.extend(re.findall(r'E\d+', citation_match))
+            
+            # Remove duplicates while preserving order
+            citation_ids = list(dict.fromkeys(citation_ids))
+            
+            # Look up cited claims
+            cited_claims = []
+            missing_ids = []
+            for cid in citation_ids:
+                if cid in evidence_dict:
+                    cited_claims.append({
+                        "id": cid,
+                        "claim": evidence_dict[cid].get("claim", ""),
+                        "quote_span": evidence_dict[cid].get("quote_span", "")
+                    })
+                else:
+                    missing_ids.append(cid)
+            
+            segments.append({
+                "segment_number": segment_number,
+                "text": sentence,
+                "citations": citation_ids,
+                "cited_claims": cited_claims,
+                "missing_evidence_ids": missing_ids,
+                "verified": None,
+                "verification_reason": None,
+                "is_sentence_level": True
+            })
+    else:
+        # Original segment-level verification: Split by citation patterns
+        current_pos = 0
         
-        # Extract citation IDs
-        citation_str = match.group(0)
-        citation_ids = re.findall(r'E\d+', citation_str)
-        
-        # Look up cited claims
-        cited_claims = []
-        missing_ids = []
-        for cid in citation_ids:
-            if cid in evidence_dict:
-                cited_claims.append({
-                    "id": cid,
-                    "claim": evidence_dict[cid].get("claim", ""),
-                    "quote_span": evidence_dict[cid].get("quote_span", "")
-                })
-            else:
-                missing_ids.append(cid)
-        
-        segments.append({
-            "segment_number": segment_number,
-            "text": segment_text,
-            "citations": citation_ids,
-            "cited_claims": cited_claims,
-            "missing_evidence_ids": missing_ids,
-            "verified": None,  # Will be filled by LLM
-            "verification_reason": None
-        })
-        
-        current_pos = segment_end
+        # Find all citations and their positions
+        for match in re.finditer(citation_pattern, styled_output):
+            segment_number += 1
+            
+            # Extract text from last position to end of this citation
+            segment_end = match.end()
+            segment_text = styled_output[current_pos:segment_end].strip()
+            
+            # Extract citation IDs
+            citation_str = match.group(0)
+            citation_ids = re.findall(r'E\d+', citation_str)
+            
+            # Look up cited claims
+            cited_claims = []
+            missing_ids = []
+            for cid in citation_ids:
+                if cid in evidence_dict:
+                    cited_claims.append({
+                        "id": cid,
+                        "claim": evidence_dict[cid].get("claim", ""),
+                        "quote_span": evidence_dict[cid].get("quote_span", "")
+                    })
+                else:
+                    missing_ids.append(cid)
+            
+            segments.append({
+                "segment_number": segment_number,
+                "text": segment_text,
+                "citations": citation_ids,
+                "cited_claims": cited_claims,
+                "missing_evidence_ids": missing_ids,
+                "verified": None,
+                "verification_reason": None,
+                "is_sentence_level": False
+            })
+            
+            current_pos = segment_end
     
-    print(f"Parsed {len(segments)} segments with citations")
+    print(f"Parsed {len(segments)} {'sentences' if sentence_level else 'segments'} with citations")
     
     # Initialize Azure client if not provided
     if not azure_llm_client:
@@ -1737,7 +2078,8 @@ Your response:"""
         "verified_segments": verified_count,
         "unverified_segments": unverified_count,
         "verification_rate": f"{verification_rate:.1f}%",
-        "segments": segments
+        "segments": segments,
+        "is_sentence_level": sentence_level  # IMPROVEMENT #4: Flag for sentence-level verification
     }
 
 
@@ -1800,12 +2142,15 @@ async def process_with_iterative_refinement_and_style(
     
     # Get cumulative evidence store for citation validation
     cumulative_evidence = refinement_results.get("cumulative_evidence_store", [])
+    print(f"[DEBUG] Evidence store size: {len(cumulative_evidence)} items")
+    print(f"[DEBUG] Final summary length: {len(final_summary)} chars")
     
     styled_result = await generate_styled_output(
         final_summary, 
         query, 
         style,
-        evidence_store=cumulative_evidence
+        evidence_store=cumulative_evidence,
+        use_claim_outline=True  # IMPROVEMENT #1: Explicitly enable claim-based styling
     )
     
     if styled_result.get("success"):
@@ -1836,7 +2181,8 @@ async def process_with_iterative_refinement_and_style(
         try:
             verification_result = await verify_styled_citations(
                 styled_output=styled_result.get("styled_output", ""),
-                evidence_store=cumulative_evidence
+                evidence_store=cumulative_evidence,
+                sentence_level=True  # IMPROVEMENT #4: Use sentence-level verification
             )
             
             print(f"\n✓ Citation verification complete")

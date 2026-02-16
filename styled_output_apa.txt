@@ -1,60 +1,44 @@
 Query: Use of AI models for financial portfolio management and risk predictions
 
 Style: None
-Speaker: Eli M. Remolona Jr.
-Audience: INTERNATIONAL_OFFICIAL
+Speaker: Benjamin E. Diokno
+Audience: PUBLIC_REGIONAL
 
 ======================================================================
 STYLED OUTPUT (APA FORMAT)
 ======================================================================
 
-Good morning, ladies and gentlemen.
+Good afternoon, colleagues, partners, and friends. Thank you for inviting us to reflect on how AI models can help manage portfolios and strengthen risk practices.
 
-It is my pleasure to welcome our international colleagues to this session.
+Let me set the context. We gather to share practical lessons that support inclusive growth and responsible innovation. Our goal is simple: better services for our communities through data, discipline, and cooperation.
 
-We thank our hosts and partner institutions for bringing us together today.
+First, on speed and scale. Modern platforms now make microsecond-level portfolio rebalancing possible (AIM Journals, n.d.). Lower latency is directly linked to gains in risk-adjusted returns (ResearchGate, n.d.). Event streaming backbones can deliver market data feeds with microsecond latencies (Medium, n.d.; Estuary, n.d.). Distributed computing architectures can process derivatives data streams at petabyte scale (AIM Journals, n.d.). This suggests that timely decisions and resilient infrastructure can move together.
 
-Our focus is the use of AI models for portfolio management and risk prediction.
+Second, on risk models and governance. Machine learning models strengthen risk governance (PeakPotentia, n.d.). These models bring in non-traditional credit indicators to enrich assessment (PeakPotentia, n.d.). They also integrate high-frequency market microstructure data for deeper insight (PeakPotentia, n.d.). Network learning architectures help anticipate systemic risks by mapping interdependencies (ResearchGate, n.d.). SHAP values sustain transparency across hybrid environments (Springer Nature, 2025). A key implication is clear: we can be innovative and accountable at the same time.
 
-Modern AI and machine learning systems adapt to real-time market conditions and integrate behavioral economics principles like prospect theory to model investor decisions more realistically (PeakPotentia, n.d.; Madison Proceedings, n.d.). These systems address cognitive biases and emotional factors that classical models often overlook (Madison Proceedings, n.d.). In empirical studies, they achieve 15.7 percent higher Sharpe ratios and 12.4 percent greater returns than traditional benchmarks (pm-research.com, 2024).
+Third, on adaptation. Adaptive ensemble frameworks address concept drift as conditions change (PeakPotentia, n.d.; ResearchGate, n.d.). Self-optimizing strategies can shift asset allocations automatically during structural market shifts (PeakPotentia, n.d.). This tells us that flexible tools are vital when markets evolve.
 
-Reinforcement learning architectures are impactful in this space, with frameworks such as RL-APM using DDPG agents to process OHLCV data and technical indicators for multi-asset management (pm-research.com, 2024). Models including A2C, PPO, and DDPG optimize asset weights through Sharpe ratio maximization across both crypto and traditional portfolios (pm-research.com, 2024). BBAPT frameworks incorporate investor biases through adjusted reward functions (Nature, n.d.). Despite implementation challenges in fintech applications (pm-research.com, 2024), these systems demonstrate improved scalability and risk-aware optimization (pm-research.com, 2024).
+Fourth, on narratives and market signals. Latent Dirichlet Allocation extracts narrative content from central bank communications (Melo et al., 2022). That narrative content has meaningful effects on yield curve dynamics (Melo et al., 2022). For instance, Banco de la República’s monetary policy minutes influenced all analyzed market rates (Melo et al., 2022). By contrast, numeric inflation forecasts showed no significant effects on those rates (Melo et al., 2022). This suggests that words and guidance can shape outcomes beyond numbers alone.
 
-For risk prediction, Bayesian semiparametric models analyze multiple related multi-state processes through joint random effects on transition rates (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Gaussian Graphical Models identify risk clusters in financial systems (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Deep learning architectures such as RNNs and LSTMs enhance predictive accuracy by capturing nonlinear relationships and temporal dependencies in volatile markets (ResearchGate, n.d.). Explainable AI methods such as SHAP and LIME address interpretability challenges while supporting regulatory compliance in high-stakes settings (OptionOneTech, n.d.).
+Before I end, let me underscore why this matters. These capabilities—speed with integrity, models with transparency, and analysis that listens to narratives—can help us deliver inclusive growth and better financial services for all. They support prudent risk-taking, stronger governance, and smarter use of digital services.
 
-Natural language processing strengthens risk assessment by mining central bank communications, where narrative information from monetary policy minutes impacts all analyzed market yields (Melo et al., 2022). Topics related to domestic demand and inflation expectations are particularly influential (Melo et al., 2022). LDA analysis shows that these narrative elements have greater market impact than numerical forecasts in inflation reports (Melo et al., 2022). Publication lags likely reduce the effectiveness of these reports (Melo et al., 2022).
-
-The integration of these AI techniques enables real-time analysis of complex market interactions (Karlsruhe Institute of Technology, n.d.; ResearchGate, n.d.). Probabilistic modeling also extends to innovation pathway analysis in R&D allocation (YARIME Masaru, n.d.). Flexible random effect distributions in Bayesian frameworks account for clustering and outliers in financial risk modeling (Cremaschi et al., 2021; Andrea Cremaschi et al., 2021). Semiparametric approaches maintain adaptability to non-stationary market conditions (Andrea Cremaschi et al., 2021). Taken together, these advances show AI’s capacity to improve risk-adjusted returns and decision-making transparency in modern finance (ResearchGate, n.d.; ACM Digital Library, n.d.).
-
-In conclusion, the work before us can guide better choices, clearer communication, and stronger collaboration across markets and disciplines.
-
-Thank you and good morning.
+Again, thank you for your time and partnership. We appreciate your commitment to our shared work, and we look forward to building more resilient and inclusive markets together. Maraming salamat at mabuhay!
 
 ======================================================================
 REFERENCES
 ======================================================================
 
-ACM Digital Library (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Explainable AI for Stock Price Prediction. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+AIM Journals (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. IJIDML. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-Andrea Cremaschi et al. (2021). [2106.03072] Seemingly Unrelated Multi-State processes: a Bayesian semiparametric approach. arXiv. https://arxiv.org/abs/2106.03072
-
-Cremaschi, A., Argiento, R., Iorio, M. D., Shirong, C., Chong, Y. S., Meaney, M. J., & Kee, M. Z. L. (2021). [2106.03072] Seemingly Unrelated Multi-State processes: a Bayesian semiparametric approach. arXiv. https://arxiv.org/abs/2106.03072
-
-Karlsruhe Institute of Technology (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. KIT. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+Estuary (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Estuary. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
 Melo, L. F., Ospina, J. J., & Parra-Polania, J. A. (2022). Effects of Banco de la Republica's communication on the yield curve. BIS Working Papers. https://www.bis.org/publ/work1022.htm
 
-Madison Proceedings (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Madison Proceedings. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
-
-Nature (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Journal of Behavioral Finance. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
-
-OptionOneTech (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. The Promise of Explainable AI (XAI) in Portfolio Management. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+Medium (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Medium. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
 PeakPotentia (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Medium. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-ResearchGate (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Deep learning model-driven financial risk prediction and analysis. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+ResearchGate (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. ResearchGate. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 
-YARIME Masaru (n.d.). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Division of Public Policy, The University of Tokyo. Retrieved from Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
-
-pm-research.com (2024). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Journal of Portfolio Management. Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
+Springer Nature (2025). AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning. Nature. Deep Research: AI artificial intelligence machine learning financial portfolio management risk prediction asset allocation quantitative finance deep learning
 

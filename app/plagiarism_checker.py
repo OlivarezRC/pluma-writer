@@ -8,6 +8,7 @@ This module provides comprehensive plagiarism detection capabilities including:
 - Semantic similarity detection (embeddings)
 - Lexical similarity detection (n-gram, Jaccard)
 - Report generation and risk scoring
+- Boilerplate filtering to reduce false positives
 """
 
 import re
@@ -18,6 +19,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
 import asyncio
+
+# Import boilerplate detection
+from app.pipeline_enhancements import is_boilerplate
 
 # For embeddings
 try:
@@ -43,6 +47,7 @@ class SpeechChunk:
     normalized_text: str
     word_count: int
     char_count: int
+    is_boilerplate: bool = False  # Whether this chunk is boilerplate (greeting, closing, etc.)
 
 
 @dataclass
@@ -140,9 +145,15 @@ class TextNormalizer:
         
         chunks = []
         chunk_counter = 0
+        boilerplate_count = 0
         
         for para_idx, paragraph in enumerate(paragraphs):
             if chunk_by == "paragraph":
+                # Check if paragraph is boilerplate
+                is_boilerplate_para = is_boilerplate(paragraph, min_words=8)
+                if is_boilerplate_para:
+                    boilerplate_count += 1
+                
                 # One chunk per paragraph
                 normalized = TextNormalizer.normalize_text(paragraph)
                 chunk_id = f"{speech_id}_chunk_{chunk_counter:03d}"
@@ -155,7 +166,8 @@ class TextNormalizer:
                     sentence_indices=[],
                     normalized_text=normalized,
                     word_count=len(paragraph.split()),
-                    char_count=len(paragraph)
+                    char_count=len(paragraph),
+                    is_boilerplate=is_boilerplate_para
                 )
                 chunks.append(chunk)
                 chunk_counter += 1
@@ -163,6 +175,11 @@ class TextNormalizer:
             else:  # chunk_by == "sentence"
                 sentences = TextNormalizer.segment_into_sentences(paragraph)
                 for sent_idx, sentence in enumerate(sentences):
+                    # Check if sentence is boilerplate
+                    is_boilerplate_sent = is_boilerplate(sentence, min_words=8)
+                    if is_boilerplate_sent:
+                        boilerplate_count += 1
+                    
                     normalized = TextNormalizer.normalize_text(sentence)
                     chunk_id = f"{speech_id}_chunk_{chunk_counter:03d}"
                     
@@ -174,10 +191,14 @@ class TextNormalizer:
                         sentence_indices=[sent_idx],
                         normalized_text=normalized,
                         word_count=len(sentence.split()),
-                        char_count=len(sentence)
+                        char_count=len(sentence),
+                        is_boilerplate=is_boilerplate_sent
                     )
                     chunks.append(chunk)
                     chunk_counter += 1
+        
+        if verbose:
+            print(f"  Created {len(chunks)} chunks ({boilerplate_count} marked as boilerplate)")
         
         return chunks
 
@@ -861,8 +882,8 @@ class PlagiarismChecker:
                 )
                 matches.append(match)
             
-            # Compute chunk risk
-            is_boilerplate = PlagiarismClassifier.detect_boilerplate(speech_chunk.text)
+            # IMPROVEMENT #5: Use already-set boilerplate flag from chunking
+            is_boilerplate = speech_chunk.is_boilerplate
             
             if matches:
                 best_match = matches[0]
@@ -911,13 +932,17 @@ class PlagiarismChecker:
         if not self.azure_client:
             return
         
-        print(f"  Computing embeddings for {len(speech_chunks)} speech chunks + {len(source_chunks)} source chunks...")
+        # Filter out boilerplate chunks to save computation
+        content_speech_chunks = [c for c in speech_chunks if not c.is_boilerplate]
+        boilerplate_count = len(speech_chunks) - len(content_speech_chunks)
+        
+        print(f"  Computing embeddings for {len(content_speech_chunks)} speech chunks (skipped {boilerplate_count} boilerplate) + {len(source_chunks)} source chunks...")
         
         # Collect all texts
         texts_to_embed = []
         ids = []
         
-        for chunk in speech_chunks:
+        for chunk in content_speech_chunks:
             texts_to_embed.append(chunk.text)
             ids.append(chunk.chunk_id)
         
@@ -1096,7 +1121,9 @@ Provide a brief 1-2 sentence explanation of the similarity and whether it appear
                 "high_risk_chunks": len(high_risk_chunks),
                 "medium_risk_chunks": len(medium_risk_chunks),
                 "low_risk_chunks": len(low_risk_chunks),
-                "clean_chunks": total_chunks - len(high_risk_chunks) - len(medium_risk_chunks) - len(low_risk_chunks)
+                "clean_chunks": total_chunks - len(high_risk_chunks) - len(medium_risk_chunks) - len(low_risk_chunks),
+                # IMPROVEMENT #5: Add boilerplate filtering stats
+                "boilerplate_filtered": sum(1 for a in chunk_analyses if a.is_boilerplate)
             },
             "top_sources": top_sources,
             "flagged_chunks": [
