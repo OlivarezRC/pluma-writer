@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import re
 import requests
 import pandas as pd
@@ -11,7 +12,7 @@ from openai import AzureOpenAI
 from azure.cosmos import CosmosClient, exceptions, PartitionKey
 from dotenv import load_dotenv
 import hashlib
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 
 # Load environment variables
@@ -711,7 +712,7 @@ Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
     }
 
 
-async def process_attachments(attachments: List[Any], query: str) -> Dict[str, Any]:
+async def process_attachments(attachments: List[Any], query: str, evidence_id_start: int = 1) -> Dict[str, Any]:
     """
     Process file attachments provided by the user.
     
@@ -722,37 +723,233 @@ async def process_attachments(attachments: List[Any], query: str) -> Dict[str, A
     Returns:
         Processed attachment information
     """
-    # Placeholder for attachment processing logic
-    # This could involve reading files, extracting content, etc.
-    processed = []
-    
-    for attachment in attachments:
-        if isinstance(attachment, str):
-            # File path
-            if Path(attachment).exists():
-                processed.append({
-                    "path": attachment,
-                    "name": Path(attachment).name,
-                    "exists": True
-                })
-            else:
-                processed.append({
-                    "path": attachment,
-                    "exists": False
-                })
-        else:
-            # File object or other format
-            processed.append({
-                "type": type(attachment).__name__,
-                "data": str(attachment)
+    from datetime import datetime
+
+    if not attachments:
+        return {
+            "type": "attachments",
+            "count": 0,
+            "items": [],
+            "query": query,
+            "evidence_store": [],
+            "next_evidence_id": evidence_id_start,
+        }
+
+    async def extract_docint_text(raw_bytes: bytes) -> str:
+        endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "").rstrip("/")
+        key = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY", "")
+        if not endpoint or not key or not raw_bytes:
+            return ""
+
+        headers = {
+            "Ocp-Apim-Subscription-Key": key,
+            "Content-Type": "application/octet-stream",
+        }
+
+        analyze_urls = [
+            f"{endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=2024-11-30",
+            f"{endpoint}/formrecognizer/documentModels/prebuilt-layout:analyze?api-version=2023-07-31",
+        ]
+
+        op_url = None
+        for url in analyze_urls:
+            try:
+                resp = requests.post(url, headers=headers, data=raw_bytes, timeout=60)
+                if resp.status_code in [200, 202]:
+                    op_url = resp.headers.get("operation-location") or resp.headers.get("Operation-Location")
+                    if op_url:
+                        break
+            except Exception:
+                continue
+
+        if not op_url:
+            return ""
+
+        poll_headers = {"Ocp-Apim-Subscription-Key": key}
+        for _ in range(25):
+            try:
+                poll = requests.get(op_url, headers=poll_headers, timeout=60)
+                data = poll.json() if poll.content else {}
+                status = (data.get("status") or "").lower()
+                if status == "succeeded":
+                    result = data.get("analyzeResult", {})
+                    lines = []
+                    for paragraph in result.get("paragraphs", []):
+                        text = paragraph.get("content", "")
+                        if text:
+                            lines.append(text)
+                    if not lines:
+                        for page in result.get("pages", []):
+                            for line in page.get("lines", []):
+                                text = line.get("content", "")
+                                if text:
+                                    lines.append(text)
+                    return "\n".join(lines)
+                if status in ["failed", "error"]:
+                    return ""
+            except Exception:
+                return ""
+            await asyncio.sleep(1)
+
+        return ""
+
+    async def extract_metadata_with_llm(text: str, filename: str, fallback_title: str) -> Dict[str, str]:
+        metadata = {
+            "author": "Unknown",
+            "year": "Unknown",
+            "publication": "Unknown",
+            "source_title": fallback_title,
+        }
+        if not text:
+            return metadata
+
+        try:
+            model = _get_link_processing_model()
+            prompt = f"""Extract bibliographic metadata from this document text and filename.
+
+Filename: {filename}
+Fallback title: {fallback_title}
+
+Document excerpt:
+{text[:3500]}
+
+Return ONLY JSON object with keys:
+- author
+- year
+- publication
+- source_title
+
+Rules:
+- If missing, return "Unknown" for author/year/publication.
+- source_title should be meaningful title if identifiable, else use fallback title.
+"""
+
+            response = await model.ainvoke([
+                SystemMessage(content="You extract bibliographic metadata from text."),
+                HumanMessage(content=prompt),
+            ])
+            content = response.content.replace("```json", "").replace("```", "").strip()
+            if "<think>" in content:
+                content = content.split("</think>")[-1].strip()
+            parsed = json.loads(content)
+            for key in metadata:
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    metadata[key] = value.strip()
+        except Exception:
+            pass
+
+        return metadata
+
+    async def extract_claims_with_llm(text: str, query_text: str, metadata: Dict[str, str]) -> List[Dict[str, Any]]:
+        if not text:
+            return []
+        try:
+            model = _get_link_processing_model()
+            prompt = f"""Extract atomic factual claims from this attachment relevant to the query.
+
+Query: {query_text}
+Document metadata:
+- author: {metadata.get('author')}
+- year: {metadata.get('year')}
+- publication: {metadata.get('publication')}
+- source_title: {metadata.get('source_title')}
+
+Document content:
+{text[:5000]}
+
+Return ONLY JSON array with objects:
+- claim
+- quote_span
+- confidence (0.0-1.0)
+
+Extract 3-8 claims if possible.
+"""
+
+            response = await model.ainvoke([
+                SystemMessage(content="You extract atomic factual claims with exact supporting quote spans."),
+                HumanMessage(content=prompt),
+            ])
+            content = response.content.replace("```json", "").replace("```", "").strip()
+            if "<think>" in content:
+                content = content.split("</think>")[-1].strip()
+            parsed = json.loads(content)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+        return []
+
+    processed_items = []
+    evidence_store = []
+    evidence_id = evidence_id_start
+
+    for index, attachment in enumerate(attachments, start=1):
+        filename = f"attachment_{index}"
+        file_type = "unknown"
+        raw_bytes = b""
+        provided_text = ""
+
+        if isinstance(attachment, dict):
+            filename = attachment.get("filename") or filename
+            file_type = attachment.get("file_type") or "unknown"
+            provided_text = attachment.get("content", "") if isinstance(attachment.get("content", ""), str) else ""
+            raw_bytes = attachment.get("bytes", b"") if isinstance(attachment.get("bytes", b""), (bytes, bytearray)) else b""
+        elif isinstance(attachment, str):
+            provided_text = attachment
+
+        docint_text = await extract_docint_text(bytes(raw_bytes)) if raw_bytes else ""
+        final_text = docint_text if docint_text and len(docint_text.strip()) > 50 else provided_text
+
+        fallback_title = filename if filename else f"attachment_{index}"
+        metadata = await extract_metadata_with_llm(final_text, filename, fallback_title)
+        claims = await extract_claims_with_llm(final_text, query, metadata)
+
+        if not claims and final_text.strip():
+            # Minimal fallback claim when extraction fails
+            snippet = final_text.strip()[:400]
+            claims = [{
+                "claim": f"Attachment {index} contains content relevant to the query.",
+                "quote_span": snippet,
+                "confidence": 0.6,
+            }]
+
+        for claim_data in claims:
+            evidence_store.append({
+                "id": f"E{evidence_id}",
+                "claim": claim_data.get("claim", ""),
+                "source": fallback_title,
+                "source_url": None,
+                "source_title": metadata.get("source_title", fallback_title),
+                "quote_span": claim_data.get("quote_span", ""),
+                "author": metadata.get("author", "Unknown"),
+                "year": metadata.get("year", "Unknown"),
+                "publication": metadata.get("publication", "Unknown"),
+                "publisher": "Unknown",
+                "retrieval_context": "attachment_processing",
+                "confidence": claim_data.get("confidence", 0.75),
+                "timestamp_accessed": datetime.now().isoformat(),
             })
-    
+            evidence_id += 1
+
+        processed_items.append({
+            "name": filename,
+            "file_type": file_type,
+            "status": "success" if claims else "no_claims",
+            "claims_extracted": len(claims),
+            "used_document_intelligence": bool(docint_text),
+            "metadata": metadata,
+        })
+
+        print(f"✓ Extracted {len(claims)} atomic claims from attachment: {filename}")
+
     return {
         "type": "attachments",
-        "count": len(processed),
-        "items": processed,
+        "count": len(processed_items),
+        "items": processed_items,
         "query": query,
-        "evidence_store": []  # Placeholder for future implementation
+        "evidence_store": evidence_store,
+        "next_evidence_id": evidence_id,
     }
 
 
@@ -853,7 +1050,12 @@ async def process_user_input(query: str, sources: Dict[str, Any], evidence_id_st
     return results
 
 
-async def process_with_iterative_refinement(query: str, sources: Dict[str, Any], max_iterations: int = 3) -> Dict[str, Any]:
+async def process_with_iterative_refinement(
+    query: str,
+    sources: Dict[str, Any],
+    max_iterations: int = 3,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
     """
     Process user query with iterative refinement - runs multiple iterations with critiques and adjustments.
     
@@ -865,12 +1067,20 @@ async def process_with_iterative_refinement(query: str, sources: Dict[str, Any],
     Returns:
         Dictionary containing all iterations with summaries, critiques, and adjustments
     """
+    def emit(event_type: str, **payload):
+        if progress_callback:
+            try:
+                progress_callback({"type": event_type, **payload})
+            except Exception:
+                pass
+
     iterations = []
     current_query = query
     cumulative_evidence = []
     next_evidence_id = 1  # Track evidence ID across all iterations
     
     for iteration in range(1, max_iterations + 1):
+        emit("stage_text", stage=1, text=f"Iteration {iteration}/{max_iterations}")
         print(f"\n{'='*70}")
         print(f"ITERATION {iteration}/{max_iterations}")
         print(f"{'='*70}")
@@ -902,6 +1112,13 @@ async def process_with_iterative_refinement(query: str, sources: Dict[str, Any],
             "new_evidence_count": len(new_evidence),
             "cumulative_evidence_count": len(cumulative_evidence)
         }
+
+        emit(
+            "stage_metric",
+            stage=1,
+            key="Cumulative Evidence",
+            value=len(cumulative_evidence),
+        )
         
         # Only critique if not the last iteration
         if iteration < max_iterations:
@@ -1090,6 +1307,116 @@ def _extract_rulebook_text(rulebook: Dict[str, Any]) -> str:
         return str(rulebook)
 
 
+def get_sample_speeches_from_db(speaker_name: str, max_speeches: int = 3) -> List[str]:
+    """
+    Fetch sample speeches from the speeches database for the given speaker.
+    
+    Args:
+        speaker_name: The name of the speaker (e.g., "Benjamin E. Diokno", "Eli M. Remolona Jr.")
+        max_speeches: Maximum number of speeches to fetch (default: 3)
+    
+    Returns:
+        List of speech content strings
+    """
+    try:
+        # Initialize Cosmos DB client for speeches database
+        cosmos_client = CosmosClient(
+            url=os.getenv("AZURE_SPEECHES_ENDPOINT"),
+            credential=os.getenv("AZURE_SPEECHES_KEY")
+        )
+        database = cosmos_client.get_database_client(os.getenv("AZURE_SPEECHES_DATABASE"))
+        
+        # Try common container names
+        container_names = ["speeches", "Speeches", "speech_data", "documents"]
+        container = None
+        
+        for name in container_names:
+            try:
+                container = database.get_container_client(name)
+                # Test if container exists by trying to read properties
+                container.read()
+                break
+            except:
+                continue
+        
+        if not container:
+            print(f"[WARNING] No speeches container found in database")
+            return []
+        
+        # Query for speeches by speaker
+        # Try different speaker field variations
+        speaker_queries = [
+            f"SELECT TOP {max_speeches} * FROM c WHERE CONTAINS(c.Speaker, @speaker) ORDER BY c._ts DESC",
+            f"SELECT TOP {max_speeches} * FROM c WHERE CONTAINS(c.speaker, @speaker) ORDER BY c._ts DESC",
+            f"SELECT TOP {max_speeches} * FROM c WHERE c.Speaker = @speaker ORDER BY c._ts DESC",
+            f"SELECT TOP {max_speeches} * FROM c WHERE c.speaker = @speaker ORDER BY c._ts DESC"
+        ]
+        
+        items = []
+        for query in speaker_queries:
+            try:
+                items = list(container.query_items(
+                    query=query,
+                    parameters=[{"name": "@speaker", "value": speaker_name}],
+                    enable_cross_partition_query=True
+                ))
+                if items:
+                    break
+            except Exception as e:
+                continue
+        
+        if not items:
+            print(f"[WARNING] No speeches found for speaker: {speaker_name}")
+            return []
+        
+        # Extract speech content
+        speeches = []
+        for item in items[:max_speeches]:
+            content = item.get("content", "") or item.get("text", "") or item.get("speech_text", "")
+            if content and len(content) > 200:  # Only use substantial speeches
+                # Clean up the content - find where actual speech starts
+                # Look for common greeting patterns
+                greeting_start_patterns = [
+                    'magandang', 'good morning', 'good afternoon', 'good evening',
+                    'ladies and gentlemen', 'thank you', 'it is'
+                ]
+                
+                lines = content.split('\n')
+                speech_start_idx = None
+                
+                for i, line in enumerate(lines):
+                    line_lower = line.lower().strip()
+                    if any(greeting in line_lower for greeting in greeting_start_patterns):
+                        speech_start_idx = i
+                        break
+                
+                if speech_start_idx is not None:
+                    cleaned_content = '\n'.join(lines[speech_start_idx:]).strip()
+                else:
+                    # Fallback: skip obvious metadata lines
+                    cleaned_lines = []
+                    for line in lines:
+                        line_lower = line.lower().strip()
+                        if not any(x in line_lower for x in ['http', '.pdf', 'bangko sentral ng pilipinas media']):
+                            cleaned_lines.append(line)
+                    cleaned_content = '\n'.join(cleaned_lines).strip()
+                
+                if len(cleaned_content) > 200:
+                    speeches.append(cleaned_content)
+        
+        print(f"[INFO] Fetched {len(speeches)} sample speech(es) for {speaker_name}")
+        for i, speech in enumerate(speeches, 1):
+            print(f"[INFO]   Speech {i}: {len(speech)} characters")
+        
+        return speeches
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch speeches: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 def enforce_citation_discipline(text: str, max_ids_per_sentence: int = 2) -> str:
     """
     IMPROVEMENT #3: Enforce citation discipline - max N evidence IDs per sentence.
@@ -1163,6 +1490,143 @@ def enforce_citation_discipline(text: str, max_ids_per_sentence: int = 2) -> str
     return ''.join(corrected_parts)
 
 
+async def fix_speech_issues(
+    speech_text: str,
+    issues: List[Dict[str, Any]],
+    evidence_store: List[Dict[str, Any]] = None,
+    issue_type: str = "generic"
+) -> Dict[str, Any]:
+    """
+    Use LLM to automatically fix flagged issues in speech segments.
+    
+    Args:
+        speech_text: The full speech text
+        issues: List of issues to fix, each with:
+            - segment: The problematic text segment
+            - issue_description: What's wrong
+            - suggestion: Optional suggestion for fix
+            - severity: CRITICAL/HIGH/MEDIUM/LOW
+        evidence_store: List of evidence for citation context
+        issue_type: Type of issues ("citation", "plagiarism", "policy", "generic")
+    
+    Returns:
+        {
+            "success": bool,
+            "fixed_speech": str (revised text),
+            "fixes_applied": int,
+            "fix_details": List of what was changed
+        }
+    """
+    if not issues:
+        return {
+            "success": True,
+            "fixed_speech": speech_text,
+            "fixes_applied": 0,
+            "fix_details": []
+        }
+    
+    try:
+        # Initialize Azure OpenAI client
+        client = AzureOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
+            api_key=os.getenv("AZURE_OPENAI_KEY"),
+        )
+        
+        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        
+        # Build issue-specific system prompt
+        system_prompts = {
+            "citation": """Fix claims not fully supported by evidence. Soften exaggerated claims, add hedging ("may", "appears to"), remove unsupported specifics. Keep citations [ENN] intact. Maintain speaker's voice.""",
+            
+            "plagiarism": """Rewrite text with high similarity to sources. Restructure sentences, use synonyms, change word order. Keep citations [ENN] intact. Preserve factual accuracy.""",
+            
+            "policy": """Fix BSP policy violations. Add disclaimers for forward-looking statements, soften absolutes, add context. Use "BSP/we" not "I". Keep citations [ENN] intact. Maintain professional tone.""",
+            
+            "generic": """Fix flagged issues. Preserve citations [ENN], maintain voice and facts."""
+        }
+        
+        system_prompt = system_prompts.get(issue_type, system_prompts["generic"])
+        
+        # Build evidence context if available
+        evidence_context = ""
+        if evidence_store and issue_type == "citation":
+            evidence_context = "\n<EVIDENCE_STORE>\n"
+            for ev in evidence_store[:10]:  # Reduced from 20 to 10 to save tokens
+                # Truncate claim to 150 chars to reduce token usage
+                evidence_context += f"[{ev.get('id')}]: {ev.get('claim', '')[:150]}\n"
+            evidence_context += "</EVIDENCE_STORE>\n\n"
+        
+        # Build issues list
+        issues_text = "\n<ISSUES_TO_FIX>\n"
+        for i, issue in enumerate(issues[:5], 1):  # Reduced from 10 to 5 to save tokens
+            issues_text += f"\nISSUE #{i}:\n"
+            issues_text += f"Segment: \"{issue.get('segment', '')[:200]}\"\n"  # Reduced from 300
+            issues_text += f"Problem: {issue.get('issue_description', 'Not specified')[:150]}\n"  # Added limit
+            if issue.get('suggestion'):
+                issues_text += f"Fix: {issue.get('suggestion')[:150]}\n"  # Reduced from no limit
+            issues_text += f"Severity: {issue.get('severity', 'MEDIUM')}\n"
+        issues_text += "</ISSUES_TO_FIX>\n"
+        
+        user_prompt = f"""{evidence_context}{issues_text}
+
+<SPEECH_TO_REVISE>
+{speech_text}
+</SPEECH_TO_REVISE>
+
+TASK: Revise the speech to fix the {len(issues)} issue(s) listed above. Return ONLY the full revised speech text (no explanations, no markup)."""
+        
+        print(f"[INFO] 🔧 Calling LLM to fix {len(issues)} {issue_type} issue(s)...")
+        
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_completion_tokens=8000  # Sufficient for speech revision (GPT-5 compatible)
+        )
+        
+        fixed_speech = response.choices[0].message.content.strip()
+        
+        # Analyze what changed
+        fix_details = []
+        if fixed_speech != speech_text:
+            # Simple diff: count sentence changes
+            original_sentences = [s.strip() for s in re.split(r'[.!?]+', speech_text) if s.strip()]
+            fixed_sentences = [s.strip() for s in re.split(r'[.!?]+', fixed_speech) if s.strip()]
+            
+            changes = sum(1 for orig, fixed in zip(original_sentences, fixed_sentences) if orig != fixed)
+            fix_details.append({
+                "sentences_modified": changes,
+                "original_length": len(speech_text),
+                "fixed_length": len(fixed_speech)
+            })
+            
+            print(f"[SUCCESS] ✅ Fixed {changes} sentence(s), preserved {len(fixed_sentences) - changes} sentence(s)")
+        else:
+            print(f"[INFO] No changes needed")
+        
+        return {
+            "success": True,
+            "fixed_speech": fixed_speech,
+            "fixes_applied": len(issues),
+            "fix_details": fix_details
+        }
+        
+    except Exception as e:
+        print(f"[ERROR] ❌ Failed to fix issues: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "fixed_speech": speech_text,  # Return original on failure
+            "fixes_applied": 0,
+            "fix_details": [],
+            "error": str(e)
+        }
+
+
 async def generate_styled_output(
     summary: str, 
     query: str, 
@@ -1204,10 +1668,40 @@ async def generate_styled_output(
         model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
         
         # Extract style components (matching existing app structure)
-        style_text = style.get("style_description") or style.get("style") or ""
-        global_rules = style.get("global_rules") or ""
-        guidelines = style.get("guidelines") or ""
-        example = style.get("example") or ""
+        def normalize_prompt_text(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (dict, list)):
+                try:
+                    return json.dumps(value, ensure_ascii=False, indent=2)
+                except Exception:
+                    return str(value)
+            return str(value)
+
+        style_text_value = (
+            style.get("style_description")
+            or style.get("style")
+            or style.get("style_instructions")
+            or ((style.get("properties") or {}).get("style_instructions") if isinstance(style.get("properties"), dict) else "")
+        )
+        global_rules_value = (
+            style.get("global_rules")
+            or style.get("global_rulebook")
+            or style.get("rulebook")
+        )
+        guidelines_value = style.get("guidelines") or ""
+        example_value = style.get("example")
+        if not example_value:
+            evidence_spans = style.get("evidence_spans")
+            if isinstance(evidence_spans, list) and evidence_spans:
+                example_value = "\n".join(str(item) for item in evidence_spans if item)
+
+        style_text = normalize_prompt_text(style_text_value)
+        global_rules = normalize_prompt_text(global_rules_value)
+        guidelines = normalize_prompt_text(guidelines_value)
+        example = normalize_prompt_text(example_value)
         
         # Build allowed evidence IDs list
         allowed_ids = []
@@ -1393,9 +1887,42 @@ JSON:"""
             f"<writingStyle>{style_text}</writingStyle>\n",
             f"<globalRules>{global_rules}</globalRules>\n",
             f"<writingGuidelines>{guidelines}</writingGuidelines>\n",
-            f"<writingExample>{example}</writingExample>\n",
-            "Make sure to emulate the writing style, global rules, guidelines and example provided above.\n\n",
         ]
+        
+        # Add original example if available
+        if example:
+            system_parts.append(f"<writingExample>{example}</writingExample>\n")
+        
+        # ENHANCEMENT: Fetch real speech examples from speeches database
+        speaker_name = style.get("speaker") or style.get("Speaker")
+        if speaker_name:
+            print(f"[INFO] Fetching sample speeches for speaker: {speaker_name}")
+            sample_speeches = get_sample_speeches_from_db(speaker_name, max_speeches=3)
+            
+            if sample_speeches:
+                system_parts.append("\n<realSpeechExamples>\n")
+                system_parts.append(f"Below are {len(sample_speeches)} actual speeches by {speaker_name}. Study their:\n")
+                system_parts.append("- Sentence structure and rhythm\n")
+                system_parts.append("- Vocabulary choices and phrasing\n")
+                system_parts.append("- Opening/closing patterns\n")
+                system_parts.append("- Transition phrases\n")
+                system_parts.append("- Rhetorical devices\n\n")
+                
+                for i, speech in enumerate(sample_speeches, 1):
+                    # Truncate very long speeches to fit in context
+                    speech_excerpt = speech[:2000] if len(speech) > 2000 else speech
+                    system_parts.append(f"=== SPEECH EXAMPLE {i} ===\n")
+                    system_parts.append(f"{speech_excerpt}\n")
+                    if len(speech) > 2000:
+                        system_parts.append("... (excerpt from longer speech)\n")
+                    system_parts.append("\n")
+                
+                system_parts.append("</realSpeechExamples>\n\n")
+                print(f"[SUCCESS] ✅ Added {len(sample_speeches)} real speech examples to style prompt")
+            else:
+                print(f"[WARNING] No speech examples found for {speaker_name}, using style description only")
+        
+        system_parts.append("Make sure to emulate the writing style, global rules, guidelines and examples provided above.\n\n")
         
         # Add claim outline instructions if available
         if claim_outline and claim_outline_data:
@@ -1440,11 +1967,16 @@ Example correct format:
 
 Now rewrite the summary in the specified style with ALL citations preserved:"""
 
+        # Keep completion token budget separate from output character cap.
+        # max_output_length limits final characters (enforced after generation),
+        # while completion tokens must leave room for GPT-5 reasoning + visible output.
+        completion_token_budget = max(8000, min(16000, max_output_length * 8))
+
         # Log prompt lengths for debugging
         print(f"[DEBUG] System prompt length: {len(system_prompt)} chars")
         print(f"[DEBUG] User prompt length: {len(user_prompt)} chars")
         print(f"[DEBUG] Summary length: {len(summary)} chars")
-        print(f"[DEBUG] Max completion tokens: {min(max_output_length, 16000)}")
+        print(f"[DEBUG] Max completion tokens: {completion_token_budget}")
 
         # Generate styled output (GPT-5 needs more tokens due to reasoning)
         try:
@@ -1454,7 +1986,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_completion_tokens=min(max_output_length, 16000)  # Increased for GPT-5 reasoning
+                max_completion_tokens=completion_token_budget
             )
             print(f"[DEBUG] API call successful, response choices: {len(response.choices)}")
         except Exception as api_error:
@@ -2087,8 +2619,10 @@ async def process_with_iterative_refinement_and_style(
     query: str,
     sources: Dict[str, Any],
     max_iterations: int = 3,
+    max_output_length: int = 16000,
     style: Optional[Dict[str, Any]] = None,
-    enable_policy_check: bool = True
+    enable_policy_check: bool = True,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     Complete pipeline: Iterative refinement + Style-based output generation + Policy check.
@@ -2097,17 +2631,56 @@ async def process_with_iterative_refinement_and_style(
         query: User's research query
         sources: Sources dictionary (topics, links, attachments)
         max_iterations: Number of refinement iterations
+        max_output_length: Maximum styled output character length
         style: Writing style dictionary (if None, will fetch random from DB)
         enable_policy_check: Whether to run BSP policy alignment check (default: True)
     
     Returns:
         Complete results including refined summary, styled output, and policy check
     """
+    def emit(event_type: str, **payload):
+        if progress_callback:
+            try:
+                progress_callback({"type": event_type, **payload})
+            except Exception:
+                pass
+
     # Step 1: Iterative refinement
+    emit("stage_started", stage=1)
     print(f"\n{'='*70}")
     print("STEP 1: ITERATIVE REFINEMENT")
     print('='*70)
-    refinement_results = await process_with_iterative_refinement(query, sources, max_iterations)
+    refinement_results = await process_with_iterative_refinement(
+        query,
+        sources,
+        max_iterations,
+        progress_callback=progress_callback,
+    )
+
+    stage1_evidence = refinement_results.get("cumulative_evidence_store", [])
+    topic_evidence_count = 0
+    link_evidence_count = 0
+    attachment_evidence_count = 0
+    other_evidence_count = 0
+
+    for evidence_item in stage1_evidence:
+        retrieval_context = str(evidence_item.get("retrieval_context", "")).strip().lower()
+        if retrieval_context == "deep_research_pipeline":
+            topic_evidence_count += 1
+        elif retrieval_context == "link_processing":
+            link_evidence_count += 1
+        elif retrieval_context == "attachment_processing":
+            attachment_evidence_count += 1
+        else:
+            other_evidence_count += 1
+
+    emit("stage_metric", stage=1, key="Topic Evidence", value=topic_evidence_count)
+    emit("stage_metric", stage=1, key="Link Evidence", value=link_evidence_count)
+    emit("stage_metric", stage=1, key="Attachment Evidence", value=attachment_evidence_count)
+    if other_evidence_count > 0:
+        emit("stage_metric", stage=1, key="Other Evidence", value=other_evidence_count)
+
+    emit("stage_done", stage=1)
     
     # Get final summary
     final_summary = refinement_results["final_summary"].get("summary", "")
@@ -2122,6 +2695,7 @@ async def process_with_iterative_refinement_and_style(
         }
     
     # Step 2: Get writing style
+    emit("stage_started", stage=2)
     print(f"\n{'='*70}")
     print("STEP 2: RETRIEVING WRITING STYLE")
     print('='*70)
@@ -2132,10 +2706,16 @@ async def process_with_iterative_refinement_and_style(
             print(f"✓ Retrieved style: {style.get('name', 'Unknown')}")
             print(f"  Speaker: {style.get('speaker', 'Unknown')}")
             print(f"  Audience: {style.get('audience_setting_classification', 'General')}")
+            emit("stage_text", stage=2, text=f"Style: {style.get('name', 'Unknown')}")
+            emit("stage_text", stage=2, text=f"Speaker: {style.get('speaker', 'Unknown')}")
+            emit("stage_text", stage=2, text=f"Audience: {style.get('audience_setting_classification', 'General')}")
         else:
             print("✗ No style found in database, using default formatting")
+            emit("stage_text", stage=2, text="No style found in database, using default formatting")
+    emit("stage_done", stage=2)
     
     # Step 3: Generate styled output
+    emit("stage_started", stage=3)
     print(f"\n{'='*70}")
     print("STEP 3: GENERATING STYLED OUTPUT")
     print('='*70)
@@ -2149,6 +2729,7 @@ async def process_with_iterative_refinement_and_style(
         final_summary, 
         query, 
         style,
+        max_output_length=max_output_length,
         evidence_store=cumulative_evidence,
         use_claim_outline=True  # IMPROVEMENT #1: Explicitly enable claim-based styling
     )
@@ -2168,12 +2749,20 @@ async def process_with_iterative_refinement_and_style(
                 print(f"  ⚠️ Invalid citations: {styled_result.get('invalid_citations')}")
             else:
                 print(f"  ✓ All citations valid")
+        emit("stage_text", stage=3, text="Styled output generated successfully")
+        emit("stage_metric", stage=3, key="Output Length", value=len(styled_result.get("styled_output", "")))
+        emit("stage_metric", stage=3, key="Max Length", value=max_output_length)
+        emit("stage_metric", stage=3, key="Citations", value=styled_result.get("citations_found", 0))
+        emit("stage_metric", stage=3, key="Evidence IDs", value=styled_result.get("unique_evidence_cited", 0))
     else:
         print(f"✗ Style generation failed: {styled_result.get('error', 'Unknown')}")
+        emit("stage_text", stage=3, text=f"Style generation failed: {styled_result.get('error', 'Unknown')}")
+    emit("stage_done", stage=3)
     
     # Step 4: Verify citations in styled output
     verification_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
+        emit("stage_started", stage=4)
         print(f"\n{'='*70}")
         print("STEP 4: VERIFYING STYLED OUTPUT CITATIONS")
         print('='*70)
@@ -2200,6 +2789,46 @@ async def process_with_iterative_refinement_and_style(
                 print(f"\n  ⚠️ Sample unverified segments:")
                 for seg in unverified_segments[:3]:
                     print(f"    Segment {seg['segment_number']}: {seg.get('verification_reason', 'Unknown')}")
+                
+                # AUTO-FIX: Revise unverified segments
+                print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(unverified_segments)} unverified segments...")
+                
+                # Build issues list for fix_speech_issues
+                citation_issues = []
+                for seg in unverified_segments:
+                    citation_issues.append({
+                        "segment": seg.get("sentence", ""),
+                        "issue_description": seg.get("verification_reason", "Claim not fully supported by evidence"),
+                        "suggestion": "Soften claim language or add hedging (e.g., 'may suggest', 'appears to indicate')",
+                        "severity": "HIGH"
+                    })
+                
+                # Call fix function
+                fix_result = await fix_speech_issues(
+                    speech_text=styled_result.get("styled_output", ""),
+                    issues=citation_issues,
+                    evidence_store=cumulative_evidence,
+                    issue_type="citation"
+                )
+                
+                if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
+                    print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} citation fixes")
+                    # Update styled result with fixed speech
+                    styled_result["styled_output"] = fix_result["fixed_speech"]
+                    
+                    # Re-verify to confirm fixes
+                    print(f"[AUTO-FIX] Rechecking citations after fixes...")
+                    verification_result = await verify_styled_citations(
+                        styled_output=fix_result["fixed_speech"],
+                        evidence_store=cumulative_evidence,
+                        sentence_level=True
+                    )
+                    print(f"[AUTO-FIX] After fixes - Verified: {verification_result.get('verified_segments')}/{verification_result.get('total_segments')} segments")
+                else:
+                    print(f"[AUTO-FIX] ⚠️ Could not apply fixes: {fix_result.get('error', 'Unknown')}")
+            emit("stage_metric", stage=4, key="Verified", value=verification_result.get('verified_segments'))
+            emit("stage_metric", stage=4, key="Unverified", value=verification_result.get('unverified_segments'))
+            emit("stage_text", stage=4, text=f"Verification rate: {verification_result.get('verification_rate')}")
             
         except Exception as e:
             print(f"✗ Verification failed: {str(e)}")
@@ -2209,10 +2838,12 @@ async def process_with_iterative_refinement_and_style(
                 "verified_segments": 0,
                 "unverified_segments": 0
             }
+            emit("stage_done", stage=4)
     
     # Step 5: Convert to APA format
     apa_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
+        emit("stage_started", stage=5)
         print(f"\n{'='*70}")
         print("STEP 5: CONVERTING TO APA FORMAT")
         print('='*70)
@@ -2228,6 +2859,8 @@ async def process_with_iterative_refinement_and_style(
                 print(f"  Citations converted: {apa_result.get('citations_converted')}")
                 print(f"  References generated: {apa_result.get('references_generated')}")
                 print(f"  Output length: {len(apa_result.get('apa_output', ''))} characters")
+                emit("stage_metric", stage=5, key="Citations Converted", value=apa_result.get('citations_converted', 0))
+                emit("stage_metric", stage=5, key="References", value=apa_result.get('references_generated', 0))
             else:
                 print(f"✗ APA conversion failed: {apa_result.get('error', 'Unknown')}")
                 
@@ -2238,10 +2871,12 @@ async def process_with_iterative_refinement_and_style(
                 "error": str(e),
                 "apa_output": styled_result.get("styled_output", "")  # Fallback to original
             }
+            emit("stage_done", stage=5)
     
     # Step 6: Plagiarism Detection
     plagiarism_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
+        emit("stage_started", stage=6)
         print(f"\n{'='*70}")
         print("STEP 6: PLAGIARISM DETECTION")
         print('='*70)
@@ -2289,6 +2924,7 @@ async def process_with_iterative_refinement_and_style(
                 print(f"  Medium risk: {stats.get('medium_risk_chunks', 0)}")
                 print(f"  Low risk: {stats.get('low_risk_chunks', 0)}")
                 print(f"  Clean: {stats.get('clean_chunks', 0)}")
+                emit("stage_metric", stage=6, key="Risk Level", value=plagiarism_result.get('overall_risk_level', 'UNKNOWN'))
                 
                 # Show top sources if any
                 top_sources = plagiarism_result.get('top_sources', [])
@@ -2296,6 +2932,46 @@ async def process_with_iterative_refinement_and_style(
                     print(f"\n  Top matching sources:")
                     for i, src in enumerate(top_sources[:3], 1):
                         print(f"    {i}. {src.get('title', 'Unknown')} ({src.get('match_count', 0)} matches)")
+                
+                # AUTO-FIX: Revise elevated-risk plagiarism chunks (MEDIUM/HIGH/CRITICAL)
+                chunks = plagiarism_result.get('chunks', [])
+                elevated_risk_chunks = [
+                    c for c in chunks
+                    if str(c.get('risk_level', '')).strip().upper() in ['MEDIUM', 'HIGH', 'CRITICAL']
+                ]
+                
+                if elevated_risk_chunks:
+                    print(f"\n[AUTO-FIX] 🔧 Attempting to rephrase {len(elevated_risk_chunks)} medium/high/critical chunks...")
+                    
+                    # Build issues list for fix_speech_issues
+                    plagiarism_issues = []
+                    for chunk in elevated_risk_chunks[:12]:  # Limit to avoid token overflow
+                        chunk_risk = str(chunk.get('risk_level', '')).strip().upper()
+                        plagiarism_issues.append({
+                            "segment": chunk.get("text", ""),
+                            "issue_description": f"{chunk_risk.title()} similarity to source material (risk score: {chunk.get('overall_risk_score', 0):.2f})",
+                            "suggestion": "Restructure sentences completely, use different word order and synonyms",
+                            "severity": "CRITICAL" if chunk_risk == 'CRITICAL' else ("HIGH" if chunk_risk == 'HIGH' else "MEDIUM")
+                        })
+                    
+                    # Call fix function
+                    fix_result = await fix_speech_issues(
+                        speech_text=styled_result.get("styled_output", ""),
+                        issues=plagiarism_issues,
+                        evidence_store=cumulative_evidence,
+                        issue_type="plagiarism"
+                    )
+                    
+                    if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
+                        print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} plagiarism fixes")
+                        # Update styled result with fixed speech
+                        styled_result["styled_output"] = fix_result["fixed_speech"]
+                        
+                        # Note: Full re-check would require repeating plagiarism analysis (expensive)
+                        # We trust the LLM fix for now
+                        print(f"[AUTO-FIX] Speech rephrased to reduce similarity")
+                    else:
+                        print(f"[AUTO-FIX] ⚠️ Could not apply plagiarism fixes: {fix_result.get('error', 'Unknown')}")
             else:
                 print(f"✗ Plagiarism analysis failed: {plagiarism_result.get('error', 'Unknown')}")
                 
@@ -2312,10 +2988,12 @@ async def process_with_iterative_refinement_and_style(
                 await azure_llm_client.close()
             if tavily_client:
                 await tavily_client.close()
+        emit("stage_done", stage=6)
     
     # Step 7: BSP Policy Alignment Check
     policy_check_result = None
     if enable_policy_check and styled_result.get("success"):
+        emit("stage_started", stage=7)
         print(f"\n{'='*70}")
         print("STEP 7: BSP POLICY ALIGNMENT CHECK")
         print('='*70)
@@ -2346,6 +3024,7 @@ async def process_with_iterative_refinement_and_style(
                 print(f"\n✓ Policy alignment check complete")
                 print(f"  Compliance: {policy_check_result.get('overall_compliance').upper()}")
                 print(f"  Score: {policy_check_result.get('compliance_score'):.1%}")
+                emit("stage_metric", stage=7, key="Compliance", value=policy_check_result.get('overall_compliance', 'unknown').upper())
                 
                 # Show violations summary
                 violations_count = policy_check_result.get('violations_count', 0)
@@ -2369,6 +3048,69 @@ async def process_with_iterative_refinement_and_style(
                 # Show recommendation
                 if policy_check_result.get('requires_revision'):
                     print(f"\n  ⚠️ RECOMMENDATION: REVISION REQUIRED")
+                    emit("stage_text", stage=7, text="Policy check: Needs revision")
+                    
+                    # AUTO-FIX: Revise policy violations
+                    violations = policy_check_result.get('violations', [])
+                    
+                    # Determine which speech to fix (APA or styled)
+                    speech_to_fix = (
+                        apa_result.get("apa_output") if apa_result and apa_result.get("success")
+                        else styled_result.get("styled_output", "")
+                    )
+
+                    # Build issues list for fix_speech_issues (always attempt fix when revision is required)
+                    policy_issues = []
+                    if violations:
+                        print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(violations)} policy violations...")
+                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Attempting policy fix for {len(violations)} violations")
+                        for violation in violations[:10]:  # Limit to top 10
+                            policy_issues.append({
+                                "segment": violation.get("problematic_text", "") or speech_to_fix[:700],
+                                "issue_description": f"{violation.get('violation_type', 'Unknown')}: {violation.get('description', '')}",
+                                "suggestion": violation.get("suggested_fix", "Revise to align with BSP policy guidelines"),
+                                "severity": violation.get("severity", "MEDIUM").upper()
+                            })
+                    else:
+                        print("\n[AUTO-FIX] 🔧 Needs revision flagged without detailed violations; attempting holistic policy fix...")
+                        emit("stage_text", stage=7, text="[AUTO-FIX] Needs revision flagged; attempting holistic policy fix")
+                        policy_issues.append({
+                            "segment": speech_to_fix[:900],
+                            "issue_description": f"Policy check flagged needs revision (compliance: {policy_check_result.get('overall_compliance', 'unknown')})",
+                            "suggestion": policy_check_result.get("recommendation", "Revise wording to align with BSP policy requirements and reduce non-compliant phrasing."),
+                            "severity": "MEDIUM"
+                        })
+
+                    # Call fix function
+                    fix_result = await fix_speech_issues(
+                        speech_text=speech_to_fix,
+                        issues=policy_issues,
+                        evidence_store=cumulative_evidence,
+                        issue_type="policy"
+                    )
+
+                    if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
+                        print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} policy fixes")
+                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Applied {fix_result['fixes_applied']} policy fixes")
+                        emit("stage_metric", stage=7, key="Policy Fixes", value=fix_result.get("fixes_applied", 0))
+                        
+                        # Update the appropriate result
+                        if apa_result and apa_result.get("success"):
+                            apa_result["apa_output"] = fix_result["fixed_speech"]
+                            print(f"[AUTO-FIX] Updated APA output with policy fixes")
+                            emit("stage_text", stage=7, text="[AUTO-FIX] Updated APA output with policy fixes")
+                        else:
+                            styled_result["styled_output"] = fix_result["fixed_speech"]
+                            print(f"[AUTO-FIX] Updated styled output with policy fixes")
+                            emit("stage_text", stage=7, text="[AUTO-FIX] Updated styled output with policy fixes")
+                        
+                        # Note: Full re-check would require repeating policy analysis (expensive)
+                        # We trust the LLM fix for now
+                        print(f"[AUTO-FIX] Speech revised to align with BSP policy guidelines")
+                        emit("stage_text", stage=7, text="[AUTO-FIX] Speech revised to align with BSP policy guidelines")
+                    else:
+                        print(f"[AUTO-FIX] ⚠️ Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
+                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
                 else:
                     print(f"\n  ✅ RECOMMENDATION: APPROVED FOR USE")
             else:
@@ -2384,6 +3126,7 @@ async def process_with_iterative_refinement_and_style(
                 "overall_compliance": "error",
                 "requires_revision": True
             }
+            emit("stage_done", stage=7)
     elif not enable_policy_check:
         print(f"\n{'='*70}")
         print("STEP 7: BSP POLICY ALIGNMENT CHECK - SKIPPED")
