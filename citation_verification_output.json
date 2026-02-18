@@ -1,0 +1,156 @@
+{
+  "total_segments": 8,
+  "verified_segments": 8,
+  "unverified_segments": 0,
+  "verification_rate": "100.0%",
+  "segments": [
+    {
+      "segment_number": 1,
+      "text": "Transformer neural networks introduced revolutionary innovations in sequence modeling. The architecture eliminates recurrent connections entirely, relying solely on attention mechanisms [E1]",
+      "citations": [
+        "E1"
+      ],
+      "cited_claims": [
+        {
+          "id": "E1",
+          "claim": "Transformers use only attention mechanisms, no recurrence",
+          "quote_span": "The Transformer model architecture eschews recurrence and instead relies entirely on an attention mechanism"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 2,
+      "text": ". This design choice enables parallel processing during training, significantly reducing computational time compared to RNNs [E2,E3]",
+      "citations": [
+        "E2",
+        "E3"
+      ],
+      "cited_claims": [
+        {
+          "id": "E2",
+          "claim": "Parallel processing is enabled by removing recurrence",
+          "quote_span": "This allows for significantly more parallelization"
+        },
+        {
+          "id": "E3",
+          "claim": "Training time is reduced compared to recurrent models",
+          "quote_span": "and can reach a new state of the art in translation quality after being trained for as little as twelve hours"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 3,
+      "text": ".\n\nThe core innovation is the multi-head attention mechanism, which allows the model to attend to different representation subspaces simultaneously [E4]",
+      "citations": [
+        "E4"
+      ],
+      "cited_claims": [
+        {
+          "id": "E4",
+          "claim": "Multi-head attention attends to different representation subspaces",
+          "quote_span": "Multi-head attention allows the model to jointly attend to information from different representation subspaces"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 4,
+      "text": ". Each attention head computes scaled dot-product attention using the formula: Attention(Q,K,V) = softmax(QK^T/\u221ad_k)V [E5]",
+      "citations": [
+        "E5"
+      ],
+      "cited_claims": [
+        {
+          "id": "E5",
+          "claim": "Attention uses scaled dot-product formula",
+          "quote_span": "We call our particular attention 'Scaled Dot-Product Attention'"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 5,
+      "text": ". This formulation ensures stable gradients during training [E6]",
+      "citations": [
+        "E6"
+      ],
+      "cited_claims": [
+        {
+          "id": "E6",
+          "claim": "Scaling factor ensures stable gradients",
+          "quote_span": "We suspect that for large values of dk, the dot products grow large in magnitude, pushing the softmax function into regions where it has extremely small gradients"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 6,
+      "text": ".\n\nPositional encodings are injected into the input embeddings to provide sequence order information, since the model lacks recurrence [E7]",
+      "citations": [
+        "E7"
+      ],
+      "cited_claims": [
+        {
+          "id": "E7",
+          "claim": "Positional encodings provide sequence order information",
+          "quote_span": "Since our model contains no recurrence and no convolution, in order for the model to make use of the order of the sequence, we must inject some information about the relative or absolute position"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 7,
+      "text": ". The original paper used sinusoidal functions for this purpose [E8]",
+      "citations": [
+        "E8"
+      ],
+      "cited_claims": [
+        {
+          "id": "E8",
+          "claim": "Sinusoidal functions used for positional encoding",
+          "quote_span": "In this work, we use sine and cosine functions of different frequencies"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    },
+    {
+      "segment_number": 8,
+      "text": ". These innovations collectively led to superior performance on machine translation benchmarks, outperforming previous state-of-the-art models [E9,E10]",
+      "citations": [
+        "E9",
+        "E10"
+      ],
+      "cited_claims": [
+        {
+          "id": "E9",
+          "claim": "Superior performance on translation benchmarks",
+          "quote_span": "achieves a new single-model state-of-the-art BLEU score of 41.8 on the WMT 2014 English-to-German translation task"
+        },
+        {
+          "id": "E10",
+          "claim": "Outperforms previous state-of-the-art models",
+          "quote_span": "improving over the existing best results, including ensembles, by over 2 BLEU"
+        }
+      ],
+      "missing_evidence_ids": [],
+      "verified": "Yes",
+      "verification_reason": "Claims match cited evidence"
+    }
+  ]
+}

@@ -1,0 +1,174 @@
+{
+  "query": "What are the key architectural components of transformer neural networks?",
+  "evidence_count": 15,
+  "evidence_store": [
+    {
+      "id": "E1",
+      "claim": "The Transformer architecture consists of encoder and decoder components with Self-Attention as its foundational mechanism.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "The Transformer architecture consists of encoder and decoder components, with **Self-Attention** as its foundational mechanism.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808264"
+    },
+    {
+      "id": "E2",
+      "claim": "The encoder processes input tokens simultaneously to analyze relationships between all words through attention score calculations.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "The encoder processes input tokens simultaneously, analyzing relationships between all words in parallel through attention score calculations to capture contextual dependencies.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808276"
+    },
+    {
+      "id": "E3",
+      "claim": "The decoder uses Masked Self-Attention to restrict attention to previously generated tokens during text generation.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "The decoder uses **Masked Self-Attention**, restricting attention to previously generated tokens during text generation to ensure sequential output without future token leakage.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808279"
+    },
+    {
+      "id": "E4",
+      "claim": "Dropout with a rate of 0.1-0.3 is applied to attention outputs and feed-forward network layers in Transformers.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "**Dropout** (typically 0.1-0.3 rate for Transformers) is applied to attention outputs and feed-forward network layers",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808281"
+    },
+    {
+      "id": "E5",
+      "claim": "An example implementation of dropout in residual connections is `nn.Dropout(dropout_rate)`.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "(e.g., `nn.Dropout(dropout_rate)` in residual connections)",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808283"
+    },
+    {
+      "id": "E6",
+      "claim": "Attention Dropout directly regularizes attention weights to reduce overfitting to specific token relationships.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "**Attention Dropout** directly regularizes attention weights within self-attention mechanisms, reducing overfitting to specific token relationships.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808285"
+    },
+    {
+      "id": "E7",
+      "claim": "Weight Decay constrains parameter magnitudes during optimization, particularly effective for attention and feed-forward weights.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "**Weight Decay** constrains parameter magnitudes during optimization, particularly effective for the model's numerous attention and feed-forward weights.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808287"
+    },
+    {
+      "id": "E8",
+      "claim": "Stochastic Depth randomly bypasses entire layers during training via `stochastic_depth_layer` functions to improve robustness.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "**Stochastic Depth** randomly bypasses entire layers during training (implemented via `stochastic_depth_layer` functions), improving robustness in deeper architectures.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808289"
+    },
+    {
+      "id": "E9",
+      "claim": "Dropout layers are embedded in encoder/decoder submodules at empirically validated rates.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "dropout layers are embedded in encoder/decoder submodules at empirically validated rates",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808291"
+    },
+    {
+      "id": "E10",
+      "claim": "Weight decay affects all trainable parameters in Transformer models.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "weight decay affects all trainable parameters",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808293"
+    },
+    {
+      "id": "E11",
+      "claim": "The combination of regularization techniques enables Transformers to maintain parallel processing advantages while improving generalization for NLP tasks.",
+      "source": "Deep Research: transformer architecture components",
+      "source_url": null,
+      "source_title": "transformer architecture components",
+      "quote_span": "The combination enables Transformers to maintain their parallel processing advantages while achieving better generalization, crucial for complex NLP tasks like translation and text generation.",
+      "retrieval_context": "deep_research_pipeline",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:19:52.808295"
+    },
+    {
+      "id": "E12",
+      "claim": "The Transformer architecture is based solely on attention mechanisms, dispensing with recurrent and convolutional layers entirely.",
+      "source": "https://arxiv.org/abs/1706.03762",
+      "source_url": "https://arxiv.org/abs/1706.03762",
+      "source_title": "[1706.03762] Attention Is All You Need - arXiv",
+      "quote_span": "We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely.",
+      "retrieval_context": "link_processing",
+      "confidence": 1.0,
+      "timestamp_accessed": "2026-02-11T04:20:28.324261"
+    },
+    {
+      "id": "E13",
+      "claim": "The Transformer uses an encoder-decoder configuration common in sequence transduction models.",
+      "source": "https://arxiv.org/abs/1706.03762",
+      "source_url": "https://arxiv.org/abs/1706.03762",
+      "source_title": "[1706.03762] Attention Is All You Need - arXiv",
+      "quote_span": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration.",
+      "retrieval_context": "link_processing",
+      "confidence": 0.9,
+      "timestamp_accessed": "2026-02-11T04:20:28.324272"
+    },
+    {
+      "id": "E14",
+      "claim": "Encoder and decoder components are connected through attention mechanisms in the Transformer architecture.",
+      "source": "https://arxiv.org/abs/1706.03762",
+      "source_url": "https://arxiv.org/abs/1706.03762",
+      "source_title": "[1706.03762] Attention Is All You Need - arXiv",
+      "quote_span": "The best performing models also connect the encoder and decoder through an attention mechanism.",
+      "retrieval_context": "link_processing",
+      "confidence": 0.95,
+      "timestamp_accessed": "2026-02-11T04:20:28.324275"
+    },
+    {
+      "id": "E15",
+      "claim": "The architecture enables significantly more parallelization than recurrent networks.",
+      "source": "https://arxiv.org/abs/1706.03762",
+      "source_url": "https://arxiv.org/abs/1706.03762",
+      "source_title": "[1706.03762] Attention Is All You Need - arXiv",
+      "quote_span": "Experiments on two machine translation tasks show these models to be superior in quality while being more parallelizable and requiring significantly less time to train.",
+      "retrieval_context": "link_processing",
+      "confidence": 0.9,
+      "timestamp_accessed": "2026-02-11T04:20:28.324276"
+    }
+  ],
+  "summary": "The Transformer neural network architecture introduced a paradigm shift in sequence processing through its unique components and attention-centric design. The key architectural elements include:\n\n1. **Encoder-Decoder Structure**: Transformers employ a stacked encoder-decoder configuration common to sequence transduction models [E13]. The encoder processes all input tokens simultaneously rather than sequentially, enabling parallel computation of relationships through self-attention mechanisms [E2,E12]. The decoder generates outputs using masked self-attention that restricts attention to previously generated tokens during autoregressive prediction [E3].\n\n2. **Attention Mechanisms**: The architecture replaces recurrent operations with scaled dot-product attention as its foundational component [E12]. Encoder and decoder layers are interconnected through multi-head attention that computes attention scores between all sequence positions [E14]. This design enables significantly greater parallelization compared to RNN-based architectures [E15].\n\n3. **Regularization Components**:\n   - **Dropout**: Applied to attention outputs (0.1-0.3 rate) and feed-forward network activations [E4,E9], implemented through layers like `nn.Dropout(dropout_rate)` [E5]\n   - **Attention-Specific Regularization**: Direct dropout on attention weights prevents overfitting to specific token relationships [E6]\n   - **Weight Decay**: Constrains parameter magnitudes across all trainable weights, particularly effective for attention and feed-forward matrices [E7,E10]\n   - **Stochastic Depth**: Randomly bypasses entire layers during training through layer dropout techniques [E8]\n\nThese components work synergistically to maintain the architecture's parallel processing advantages while preventing overfitting [E11]. The complete elimination of recurrent operations in favor of attention-based computation distinguishes Transformers from previous sequence models [E12], enabling state-of-the-art performance across NLP tasks through efficient relationship modeling between all sequence elements [E14,E15].",
+  "citations_found": 14,
+  "invalid_citations": []
+}

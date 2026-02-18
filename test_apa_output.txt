@@ -1,0 +1,30 @@
+Transformer neural networks introduced revolutionary innovations in sequence modeling (Vaswani et al., 2017). The architecture eliminates recurrent connections entirely, relying solely on attention mechanisms (arXiv, 2017; n.d., 2017). This design choice enables parallel processing during training, significantly reducing computational time compared to RNNs (arXiv, 2017).
+
+The core innovation is the multi-head attention mechanism, which allows the model to attend to different representation subspaces simultaneously (n.d., 2017). Each attention head computes scaled dot-product attention using the established formula (Vaswani et al., 2017). This formulation ensures stable gradients during training (ArXiv, 2017).
+
+Positional encodings are injected into the input embeddings to provide sequence order information, since the model lacks recurrence (arXiv, 2017). The original paper used sinusoidal functions for this purpose (arXiv, 2017). These innovations collectively led to superior performance on machine translation benchmarks, outperforming previous state-of-the-art models (Google, 2017).
+
+======================================================================
+REFERENCES
+======================================================================
+
+Vaswani et al.. (2017). Transformers introduced revolutionary innovations in sequence modeling. Retrieved from https://arxiv.org/abs/1706.03762
+
+arXiv. (2017). Architecture eliminates recurrent connections. Retrieved from https://arxiv.org/abs/1706.03762
+
+n.d.. (2017). Relies solely on attention mechanisms. Retrieved from https://arxiv.org/abs/1706.03762
+
+arXiv. (2017). Enables parallel processing during training. Retrieved from https://arxiv.org/abs/1706.03762
+
+n.d.. (2017). Multi-head attention attends to different representation subspaces. Retrieved from https://arxiv.org/abs/1706.03762
+
+Vaswani et al.. (2017). Uses scaled dot-product attention formula. Retrieved from https://arxiv.org/abs/1706.03762
+
+ArXiv. (2017). Ensures stable gradients during training. Retrieved from https://arxiv.org/abs/1706.03762
+
+arXiv. (2017). Positional encodings provide sequence order information. Retrieved from https://arxiv.org/abs/1706.03762
+
+arXiv. (2017). Used sinusoidal functions for positional encoding. Retrieved from https://arxiv.org/abs/1706.03762
+
+Google. (2017). Superior performance on machine translation benchmarks. Retrieved from https://arxiv.org/abs/1706.03762
+
