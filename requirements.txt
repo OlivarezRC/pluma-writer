@@ -1,6 +1,6 @@
 streamlit
 openai
-load_dotenv
+python-dotenv
 PyPDF2
 python-docx
 python-pptx
@@ -11,6 +11,14 @@ azure-storage-blob>=12.19.0
 numpy>=1.24.0
 tavily-python>=0.3.0
 msal>=1.24.0
+aiohttp
+langchain-azure-ai
+langchain-core
+langgraph
+markdownify
+pandas
+requests
+typing-extensions
 # Optional: for HuggingFace zero-shot classification
 # transformers>=4.30.0
 # torch>=2.0.0

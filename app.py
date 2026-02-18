@@ -58,11 +58,16 @@ or_header("Input Research Query and Sources for BSP Style Writing")
 
 # Research Query
 st.text_input(
-    ":blue[**Research Query / Speech Topic:**]",
+    ":blue[**Speech Topic:**]",
     value=st.session_state.get("research_query", ""),
     help="What do you want to research and write about? E.g., 'Use of AI in financial risk management'",
     key="research_query"
 )
+
+st.info(
+    "Provide at least one source type: **Keywords (for Deep Research)**, **Source Links (URLs)**, or **Upload Attachments**."
+)
+
 
 # --- two-column layout (Col 1 / Col 2) ---
 col1, col2 = st.columns([3, 2], gap="small")
@@ -70,30 +75,11 @@ col1, col2 = st.columns([3, 2], gap="small")
 with col1:
     # Topics/Keywords for deep research
     st.text_area(
-        ":blue[**Topics / Keywords:**]",
+        ":blue[**Keywords (for Deep Research):**]",
         value=st.session_state.get("research_topics", ""),
         height=120,
         help="Space-separated keywords for deep research (e.g., 'AI artificial intelligence machine learning financial portfolio risk prediction')",
         key="research_topics",
-    )
-
-    st.text_area(
-        ":blue[**Setting / Location / Conference / Partners (Optional):**]",
-        st.session_state.get("context_details", ""),
-        height=90,
-        help="Optional context to guide greetings and speech considerations.",
-        key="context_details",
-    )
-    
-    # Max iterations for Stage 1 iterative refinement
-    st.number_input(
-        ":blue[**Stage 1 Research Iterations:**]",
-        min_value=1,
-        max_value=7,
-        value=st.session_state.get("max_iterations", 3),
-        step=1,
-        help="Number of iterative research cycles (1-7). More iterations = more comprehensive but slower.",
-        key="max_iterations"
     )
 
     # Dynamic Source Links
@@ -128,6 +114,25 @@ with col1:
     if st.button("➕ Add Source Link", key="add_link"):
         st.session_state.source_links.append("")
         st.rerun()
+
+    # Max iterations for Stage 1 iterative refinement
+    st.number_input(
+        ":blue[**Research iterations:**]",
+        min_value=1,
+        max_value=7,
+        value=st.session_state.get("max_iterations", 3),
+        step=1,
+        help="Number of iterative research cycles (1-7). More iterations = more comprehensive but slower.",
+        key="max_iterations"
+    )
+
+    st.text_area(
+        ":blue[**Setting / Location / Conference / Partners (Optional):**]",
+        st.session_state.get("context_details", ""),
+        height=90,
+        help="Optional context to guide greetings and speech considerations.",
+        key="context_details",
+    )
 
     MIN_LEN, MAX_LEN, DEFAULT_LEN = 20, 75_000, 1_000
 
