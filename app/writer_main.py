@@ -1631,6 +1631,7 @@ async def generate_styled_output(
     summary: str, 
     query: str, 
     style: Dict[str, Any], 
+    context_details: str = "",
     evidence_store: List[Dict[str, Any]] = None, 
     max_output_length: int = 16000,
     use_claim_outline: bool = True  # IMPROVEMENT #1: Use claim outlines by default
@@ -1643,6 +1644,7 @@ async def generate_styled_output(
         summary: The comprehensive summary from iterative refinement
         query: Original user query
         style: Writing style dictionary from Cosmos DB (can be None for default formatting)
+        context_details: Optional event/setting/partner context provided by user
         evidence_store: List of atomic evidence items for citation validation
         max_output_length: Maximum completion tokens for output (default: 16000 for GPT-5 reasoning)
         use_claim_outline: If True, generate claim outline first to prevent style drift
@@ -1944,7 +1946,8 @@ JSON:"""
             "3. Do NOT generate citations to non-existent evidence IDs\n",
             "4. Maintain ALL citations from the original summary\n",
             "5. If you rephrase a sentence, keep its citation intact\n",
-            "6. Multiple claims in one sentence = multiple citations [E1,E3,E7]\n\n",
+            "6. Multiple claims in one sentence = multiple citations [E1,E3,E7]\n",
+            "7. End with a short closing reflection (1-3 sentences) on why this topic matters to BSP, financial institutions, and the nation as a whole. Keep this aligned with available evidence and avoid unsupported claims.\n\n",
             f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
         ])
         
@@ -1952,6 +1955,9 @@ JSON:"""
         
         # User prompt with citation examples
         user_prompt = f"""Original Query: {query}
+
+    Setting / Location / Conference / Partners (optional context):
+    {context_details.strip() if context_details and context_details.strip() else "Not provided"}
 
 Research Summary to Rewrite:
 {summary}
@@ -1961,6 +1967,8 @@ STRICT REQUIREMENTS:
 - EVERY factual sentence MUST have [ENN] citations
 - Only use valid evidence IDs: {allowed_ids_str}
 - Do NOT remove, modify, or invent citations
+    - Use the optional setting/location/partners context naturally when relevant
+    - Include a short closing reflection on importance to BSP, financial institutions, and the nation as a whole
 
 Example correct format:
 "Transformers use attention mechanisms [E1]. They achieve better performance than RNNs [E3,E7]."
@@ -2045,9 +2053,33 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "model_used": model
             }
         
-        # Truncate if needed
+        # Truncate if needed (boundary-aware to avoid partial sentence/citation artifacts)
         if len(styled_output) > max_output_length:
-            styled_output = styled_output[:max_output_length]
+            raw_truncated = styled_output[:max_output_length]
+
+            # If citation is cut mid-way, drop from the unmatched '[' onward
+            if raw_truncated.count('[') > raw_truncated.count(']'):
+                last_open_bracket = raw_truncated.rfind('[')
+                if last_open_bracket > 0:
+                    raw_truncated = raw_truncated[:last_open_bracket].rstrip()
+
+            # Prefer ending on a natural sentence/citation boundary
+            candidate_boundaries = [
+                raw_truncated.rfind("]. "),
+                raw_truncated.rfind("].\n"),
+                raw_truncated.rfind(". "),
+                raw_truncated.rfind("? "),
+                raw_truncated.rfind("! "),
+                raw_truncated.rfind("]\n"),
+            ]
+            best_boundary = max(candidate_boundaries)
+
+            if best_boundary >= int(max_output_length * 0.6):
+                styled_output = raw_truncated[:best_boundary + 1].rstrip()
+            else:
+                styled_output = raw_truncated.rstrip()
+
+            print(f"[INFO] Output truncated to max length with boundary-safe trim ({len(styled_output)} chars)")
         
         # IMPROVEMENT #5: Enforce citation discipline (max 2 IDs per sentence)
         print("[INFO] Enforcing citation discipline (max 2 IDs/sentence)...")
@@ -2620,6 +2652,7 @@ async def process_with_iterative_refinement_and_style(
     sources: Dict[str, Any],
     max_iterations: int = 3,
     max_output_length: int = 16000,
+    context_details: str = "",
     style: Optional[Dict[str, Any]] = None,
     enable_policy_check: bool = True,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -2632,6 +2665,7 @@ async def process_with_iterative_refinement_and_style(
         sources: Sources dictionary (topics, links, attachments)
         max_iterations: Number of refinement iterations
         max_output_length: Maximum styled output character length
+        context_details: Optional event/location/partner context
         style: Writing style dictionary (if None, will fetch random from DB)
         enable_policy_check: Whether to run BSP policy alignment check (default: True)
     
@@ -2729,6 +2763,7 @@ async def process_with_iterative_refinement_and_style(
         final_summary, 
         query, 
         style,
+        context_details=context_details,
         max_output_length=max_output_length,
         evidence_store=cumulative_evidence,
         use_claim_outline=True  # IMPROVEMENT #1: Explicitly enable claim-based styling
@@ -2999,12 +3034,6 @@ async def process_with_iterative_refinement_and_style(
         print('='*70)
         
         try:
-            # Determine which version of the speech to check (prefer APA if available)
-            speech_to_check = (
-                apa_result.get("apa_output") if apa_result and apa_result.get("success")
-                else styled_result.get("styled_output", "")
-            )
-            
             # Prepare speech metadata
             speech_metadata = {
                 "topic": query,
@@ -3013,108 +3042,175 @@ async def process_with_iterative_refinement_and_style(
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "query": query
             }
-            
-            # Run policy alignment check using Azure Agent
-            policy_check_result = await check_speech_policy_alignment(
-                speech_content=speech_to_check,
-                speech_metadata=speech_metadata
-            )
-            
-            if policy_check_result.get("success"):
+            max_policy_fix_rounds = 3
+            policy_fix_round = 0
+            total_policy_fixes = 0
+
+            while True:
+                # Determine which version of the speech to check (prefer APA if available)
+                speech_to_check = (
+                    apa_result.get("apa_output") if apa_result and apa_result.get("success")
+                    else styled_result.get("styled_output", "")
+                )
+
+                print(f"\n[POLICY] Verification pass {policy_fix_round + 1}/{max_policy_fix_rounds + 1}")
+                emit("stage_text", stage=7, text=f"Policy verification pass {policy_fix_round + 1}")
+
+                # Run policy alignment check using Azure Agent
+                policy_check_result = await check_speech_policy_alignment(
+                    speech_content=speech_to_check,
+                    speech_metadata=speech_metadata
+                )
+
+                if not policy_check_result.get("success"):
+                    print(f"✗ Policy check failed: {policy_check_result.get('error', 'Unknown')}")
+                    emit("stage_text", stage=7, text=f"Policy check failed: {policy_check_result.get('error', 'Unknown')}")
+                    break
+
+                # Normalize policy decision to avoid conflicting records.
+                # Rule: score >= 95% => no revision needed; otherwise requires revision.
+                compliance_score = policy_check_result.get('compliance_score')
+                normalized_requires_revision = None
+                if isinstance(compliance_score, (int, float)):
+                    score_percent_rounded = round(compliance_score * 100, 1)
+                    normalized_requires_revision = score_percent_rounded < 95.0
+                    policy_check_result['requires_revision'] = normalized_requires_revision
+                    policy_check_result['overall_compliance'] = (
+                        'needs_revision' if normalized_requires_revision else 'approved'
+                    )
+
+                effective_requires_revision = (
+                    normalized_requires_revision
+                    if normalized_requires_revision is not None
+                    else bool(policy_check_result.get('requires_revision'))
+                )
+
+                # Ensure displayed compliance label is always consistent with final decision.
+                policy_check_result['overall_compliance'] = (
+                    'needs_revision' if effective_requires_revision else 'approved'
+                )
+
                 print(f"\n✓ Policy alignment check complete")
                 print(f"  Compliance: {policy_check_result.get('overall_compliance').upper()}")
-                print(f"  Score: {policy_check_result.get('compliance_score'):.1%}")
+                if isinstance(compliance_score, (int, float)):
+                    print(f"  Score: {compliance_score:.1%}")
                 emit("stage_metric", stage=7, key="Compliance", value=policy_check_result.get('overall_compliance', 'unknown').upper())
-                
+
                 # Show violations summary
                 violations_count = policy_check_result.get('violations_count', 0)
                 if violations_count > 0:
                     print(f"  Violations: {violations_count}")
                     print(f"    Critical: {policy_check_result.get('critical_violations', 0)}")
                     print(f"    High: {policy_check_result.get('high_violations', 0)}")
-                
+                    violations = policy_check_result.get('violations', [])
+                    if violations:
+                        print("  Violation details (top 5):")
+                        emit("stage_text", stage=7, text="Policy violations detected (showing top 5)")
+                        for idx, violation in enumerate(violations[:5], 1):
+                            violation_type = violation.get('violation_type', 'Unknown')
+                            severity = str(violation.get('severity', 'MEDIUM')).upper()
+                            description = violation.get('description', '')
+                            suggestion = violation.get('suggested_fix', '')
+                            problematic_text = (violation.get('problematic_text', '') or '').strip().replace('\n', ' ')
+                            if len(problematic_text) > 140:
+                                problematic_text = problematic_text[:140].rstrip() + "..."
+
+                            print(f"    {idx}. [{severity}] {violation_type}")
+                            if description:
+                                print(f"       Cause: {description}")
+                            if problematic_text:
+                                print(f"       Text: \"{problematic_text}\"")
+                            if suggestion:
+                                print(f"       Suggested fix: {suggestion}")
+
+                            summary_line = f"[{severity}] {violation_type}: {description}" if description else f"[{severity}] {violation_type}"
+                            emit("stage_text", stage=7, text=summary_line)
+
                 # Show commendations
                 commendations = policy_check_result.get('commendations', [])
                 if commendations:
                     print(f"  Commendations: {len(commendations)} positive findings")
-                
+
                 # Show circulars referenced
                 circulars = policy_check_result.get('circular_references', [])
                 if circulars:
                     print(f"  BSP Circulars Referenced: {len(circulars)}")
                     for i, circ in enumerate(circulars[:3], 1):
                         print(f"    {i}. {circ}")
-                
-                # Show recommendation
-                if policy_check_result.get('requires_revision'):
-                    print(f"\n  ⚠️ RECOMMENDATION: REVISION REQUIRED")
-                    emit("stage_text", stage=7, text="Policy check: Needs revision")
-                    
-                    # AUTO-FIX: Revise policy violations
-                    violations = policy_check_result.get('violations', [])
-                    
-                    # Determine which speech to fix (APA or styled)
-                    speech_to_fix = (
-                        apa_result.get("apa_output") if apa_result and apa_result.get("success")
-                        else styled_result.get("styled_output", "")
-                    )
 
-                    # Build issues list for fix_speech_issues (always attempt fix when revision is required)
-                    policy_issues = []
-                    if violations:
-                        print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(violations)} policy violations...")
-                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Attempting policy fix for {len(violations)} violations")
-                        for violation in violations[:10]:  # Limit to top 10
-                            policy_issues.append({
-                                "segment": violation.get("problematic_text", "") or speech_to_fix[:700],
-                                "issue_description": f"{violation.get('violation_type', 'Unknown')}: {violation.get('description', '')}",
-                                "suggestion": violation.get("suggested_fix", "Revise to align with BSP policy guidelines"),
-                                "severity": violation.get("severity", "MEDIUM").upper()
-                            })
-                    else:
-                        print("\n[AUTO-FIX] 🔧 Needs revision flagged without detailed violations; attempting holistic policy fix...")
-                        emit("stage_text", stage=7, text="[AUTO-FIX] Needs revision flagged; attempting holistic policy fix")
-                        policy_issues.append({
-                            "segment": speech_to_fix[:900],
-                            "issue_description": f"Policy check flagged needs revision (compliance: {policy_check_result.get('overall_compliance', 'unknown')})",
-                            "suggestion": policy_check_result.get("recommendation", "Revise wording to align with BSP policy requirements and reduce non-compliant phrasing."),
-                            "severity": "MEDIUM"
-                        })
-
-                    # Call fix function
-                    fix_result = await fix_speech_issues(
-                        speech_text=speech_to_fix,
-                        issues=policy_issues,
-                        evidence_store=cumulative_evidence,
-                        issue_type="policy"
-                    )
-
-                    if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
-                        print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} policy fixes")
-                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Applied {fix_result['fixes_applied']} policy fixes")
-                        emit("stage_metric", stage=7, key="Policy Fixes", value=fix_result.get("fixes_applied", 0))
-                        
-                        # Update the appropriate result
-                        if apa_result and apa_result.get("success"):
-                            apa_result["apa_output"] = fix_result["fixed_speech"]
-                            print(f"[AUTO-FIX] Updated APA output with policy fixes")
-                            emit("stage_text", stage=7, text="[AUTO-FIX] Updated APA output with policy fixes")
-                        else:
-                            styled_result["styled_output"] = fix_result["fixed_speech"]
-                            print(f"[AUTO-FIX] Updated styled output with policy fixes")
-                            emit("stage_text", stage=7, text="[AUTO-FIX] Updated styled output with policy fixes")
-                        
-                        # Note: Full re-check would require repeating policy analysis (expensive)
-                        # We trust the LLM fix for now
-                        print(f"[AUTO-FIX] Speech revised to align with BSP policy guidelines")
-                        emit("stage_text", stage=7, text="[AUTO-FIX] Speech revised to align with BSP policy guidelines")
-                    else:
-                        print(f"[AUTO-FIX] ⚠️ Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
-                        emit("stage_text", stage=7, text=f"[AUTO-FIX] Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
-                else:
+                # Exit loop if approved
+                if not effective_requires_revision:
                     print(f"\n  ✅ RECOMMENDATION: APPROVED FOR USE")
-            else:
-                print(f"✗ Policy check failed: {policy_check_result.get('error', 'Unknown')}")
+                    emit("stage_text", stage=7, text="Policy check: Approved for use")
+                    break
+
+                print(f"\n  ⚠️ RECOMMENDATION: REVISION REQUIRED")
+                emit("stage_text", stage=7, text="Policy check: Needs revision")
+
+                # Stop if max fix rounds reached
+                if policy_fix_round >= max_policy_fix_rounds:
+                    print(f"[AUTO-FIX] ⚠️ Max policy fix rounds reached ({max_policy_fix_rounds}). Stopping recheck loop.")
+                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Max policy fix rounds reached ({max_policy_fix_rounds})")
+                    break
+
+                # AUTO-FIX: Revise policy violations
+                violations = policy_check_result.get('violations', [])
+
+                # Build issues list for fix_speech_issues (always attempt fix when revision is required)
+                policy_issues = []
+                if violations:
+                    print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(violations)} policy violations...")
+                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Attempting policy fix for {len(violations)} violations")
+                    for violation in violations[:10]:  # Limit to top 10
+                        policy_issues.append({
+                            "segment": violation.get("problematic_text", "") or speech_to_check[:700],
+                            "issue_description": f"{violation.get('violation_type', 'Unknown')}: {violation.get('description', '')}",
+                            "suggestion": violation.get("suggested_fix", "Revise to align with BSP policy guidelines"),
+                            "severity": violation.get("severity", "MEDIUM").upper()
+                        })
+                else:
+                    print("\n[AUTO-FIX] 🔧 Needs revision flagged without detailed violations; attempting holistic policy fix...")
+                    emit("stage_text", stage=7, text="[AUTO-FIX] Needs revision flagged; attempting holistic policy fix")
+                    policy_issues.append({
+                        "segment": speech_to_check[:900],
+                        "issue_description": f"Policy check flagged needs revision (compliance: {policy_check_result.get('overall_compliance', 'unknown')})",
+                        "suggestion": policy_check_result.get("recommendation", "Revise wording to align with BSP policy requirements and reduce non-compliant phrasing."),
+                        "severity": "MEDIUM"
+                    })
+
+                # Call fix function
+                fix_result = await fix_speech_issues(
+                    speech_text=speech_to_check,
+                    issues=policy_issues,
+                    evidence_store=cumulative_evidence,
+                    issue_type="policy"
+                )
+
+                if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
+                    policy_fix_round += 1
+                    total_policy_fixes += fix_result.get("fixes_applied", 0)
+                    print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} policy fixes (round {policy_fix_round})")
+                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Applied {fix_result['fixes_applied']} policy fixes (round {policy_fix_round})")
+                    emit("stage_metric", stage=7, key="Policy Fixes", value=total_policy_fixes)
+                    emit("stage_metric", stage=7, key="Fix Rounds", value=policy_fix_round)
+
+                    # Update the appropriate result before re-verifying
+                    if apa_result and apa_result.get("success"):
+                        apa_result["apa_output"] = fix_result["fixed_speech"]
+                        print(f"[AUTO-FIX] Updated APA output with policy fixes")
+                        emit("stage_text", stage=7, text="[AUTO-FIX] Updated APA output with policy fixes")
+                    else:
+                        styled_result["styled_output"] = fix_result["fixed_speech"]
+                        print(f"[AUTO-FIX] Updated styled output with policy fixes")
+                        emit("stage_text", stage=7, text="[AUTO-FIX] Updated styled output with policy fixes")
+
+                    print(f"[AUTO-FIX] Re-running policy verification after fixes...")
+                    emit("stage_text", stage=7, text="[AUTO-FIX] Re-running policy verification after fixes")
+                    continue
+
+                print(f"[AUTO-FIX] ⚠️ Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
+                emit("stage_text", stage=7, text=f"[AUTO-FIX] Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
+                break
                 
         except Exception as e:
             print(f"✗ Policy alignment check failed: {str(e)}")
@@ -3126,7 +3222,8 @@ async def process_with_iterative_refinement_and_style(
                 "overall_compliance": "error",
                 "requires_revision": True
             }
-            emit("stage_done", stage=7)
+            emit("stage_text", stage=7, text=f"Policy alignment check failed: {str(e)}")
+        emit("stage_done", stage=7)
     elif not enable_policy_check:
         print(f"\n{'='*70}")
         print("STEP 7: BSP POLICY ALIGNMENT CHECK - SKIPPED")

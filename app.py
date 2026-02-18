@@ -1027,6 +1027,7 @@ if st.button(
                         sources=sources,
                         max_iterations=selected_max_iterations,
                         max_output_length=selected_max_output_length,
+                        context_details=context_details,
                         style=selected_style if selected_style else None,
                         enable_policy_check=True,
                         progress_callback=lambda event: event_queue.put(event),
@@ -1568,6 +1569,7 @@ if st.button(
                     query=user_query,
                     sources=sources,
                     max_iterations=user_max_iterations,
+                    context_details=context_details,
                     style=selected_style if selected_style else None,
                     enable_policy_check=True
                 )
