@@ -8,6 +8,7 @@ import os
 import json
 import time
 import asyncio
+import re
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -323,6 +324,83 @@ class AzurePolicyAgentClient:
                 full_response += item.get('text', {}).get('value', '') + "\n"
         
         return full_response.strip()
+
+    async def retrieve_policy_snippets(
+        self,
+        segment_text: str,
+        speech_metadata: Dict[str, Any],
+        top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieval-only query against the policy agent knowledge base.
+        Returns top-k policy snippets as structured JSON (no compliance judgment).
+        """
+        thread_id = await self.create_thread()
+
+        request_message = f"""Retrieve top {top_k} BSP policy snippets most relevant to this speech segment.
+
+Return ONLY a JSON array, with each item containing:
+- circular_reference
+- policy_area
+- excerpt
+- relevance_reason
+
+Do not provide compliance judgment. Do not add any prose outside JSON.
+
+SPEECH METADATA:
+- Topic: {speech_metadata.get('topic', 'Not specified')}
+- Speaker: {speech_metadata.get('speaker', 'BSP Official')}
+- Audience: {speech_metadata.get('audience', 'General audience')}
+
+SEGMENT:
+{segment_text}
+"""
+
+        await self.send_message(thread_id, request_message)
+
+        additional_instructions = (
+            "Knowledge retrieval task only. Return strict JSON array only. "
+            "No markdown, no commentary, no policy judgment."
+        )
+
+        run_id = await self.create_run(thread_id, additional_instructions)
+        await self.wait_for_run_completion(thread_id, run_id)
+
+        messages = await self.get_messages(thread_id)
+        assistant_messages = [msg for msg in messages if msg.get('role') == 'assistant']
+        if not assistant_messages:
+            return []
+
+        latest_message = assistant_messages[0]
+        content_items = latest_message.get('content', [])
+        full_response = ""
+        for item in content_items:
+            if item.get('type') == 'text':
+                full_response += item.get('text', {}).get('value', '') + "\n"
+
+        response_text = (full_response or "").strip()
+        if not response_text:
+            return []
+
+        # Robust JSON extraction
+        if '```' in response_text:
+            response_text = response_text.replace('```json', '').replace('```', '').strip()
+
+        array_start = response_text.find('[')
+        array_end = response_text.rfind(']')
+        if array_start != -1 and array_end > array_start:
+            response_text = response_text[array_start:array_end + 1]
+
+        try:
+            parsed = json.loads(response_text)
+            if isinstance(parsed, list):
+                return parsed[:top_k]
+            if isinstance(parsed, dict):
+                return [parsed]
+        except Exception:
+            return []
+
+        return []
     
     def _format_policy_check_request(
         self,
@@ -751,6 +829,292 @@ class PolicyChecker:
         else:
             print(f"\n  ✅ RECOMMENDATION: APPROVED FOR USE")
 
+    def _segment_speech(self, speech_content: str, max_segments: int = 12) -> List[Dict[str, str]]:
+        """Split speech into deterministic review segments."""
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n+', speech_content or "") if p.strip()]
+        segments: List[Dict[str, str]] = []
+
+        for idx, paragraph in enumerate(paragraphs, 1):
+            # Keep segments concise for retrieval precision
+            if len(paragraph) > 800:
+                sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', paragraph) if s.strip()]
+                chunk = []
+                chunk_len = 0
+                chunk_id = 1
+                for sentence in sentences:
+                    if chunk_len + len(sentence) > 700 and chunk:
+                        segments.append({
+                            "segment_id": f"P{idx}.{chunk_id}",
+                            "text": " ".join(chunk)
+                        })
+                        chunk_id += 1
+                        chunk = [sentence]
+                        chunk_len = len(sentence)
+                    else:
+                        chunk.append(sentence)
+                        chunk_len += len(sentence) + 1
+                if chunk:
+                    segments.append({
+                        "segment_id": f"P{idx}.{chunk_id}",
+                        "text": " ".join(chunk)
+                    })
+            else:
+                segments.append({
+                    "segment_id": f"P{idx}",
+                    "text": paragraph
+                })
+
+            if len(segments) >= max_segments:
+                break
+
+        return segments[:max_segments]
+
+    def _has_qualifier(self, text: str) -> bool:
+        qualifier_patterns = [
+            r'\bmay\b', r'\bmight\b', r'\bcould\b', r'\bsubject to\b',
+            r'\bdepending on\b', r'\bwhere appropriate\b', r'\bcommensurate\b'
+        ]
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in qualifier_patterns)
+
+    def _extract_retrieval_keywords(self, text: str, max_terms: int = 10) -> str:
+        """Extract lightweight keywords for retrieval fallback query."""
+        if not text:
+            return ""
+
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "from", "have", "has", "are", "was", "were",
+            "will", "shall", "could", "would", "should", "into", "about", "their", "there", "which",
+            "bsp", "bank", "financial", "risk", "management", "policy", "speech", "today"
+        }
+        tokens = re.findall(r"[A-Za-z][A-Za-z\-]{3,}", text.lower())
+        filtered = [t for t in tokens if t not in stopwords]
+
+        # Preserve order, unique
+        unique_terms = list(dict.fromkeys(filtered))
+        return " ".join(unique_terms[:max_terms])
+
+    async def _retrieve_snippets_with_fallback(
+        self,
+        segment_text: str,
+        speech_metadata: Dict[str, Any],
+        top_k: int
+    ) -> Dict[str, Any]:
+        """
+        Retrieval fallback chain:
+        1) full segment
+        2) shortened segment
+        3) keyword query
+        """
+        snippets = await self.client.retrieve_policy_snippets(
+            segment_text=segment_text,
+            speech_metadata=speech_metadata,
+            top_k=top_k
+        )
+        if snippets:
+            return {"snippets": snippets, "strategy": "full_segment"}
+
+        shortened = segment_text[:320].strip()
+        if shortened and shortened != segment_text:
+            snippets = await self.client.retrieve_policy_snippets(
+                segment_text=shortened,
+                speech_metadata=speech_metadata,
+                top_k=top_k
+            )
+            if snippets:
+                return {"snippets": snippets, "strategy": "shortened_segment"}
+
+        keywords = self._extract_retrieval_keywords(segment_text)
+        if keywords:
+            snippets = await self.client.retrieve_policy_snippets(
+                segment_text=keywords,
+                speech_metadata=speech_metadata,
+                top_k=top_k
+            )
+            if snippets:
+                return {"snippets": snippets, "strategy": "keyword_fallback", "query": keywords}
+
+        return {"snippets": [], "strategy": "none"}
+
+    def _find_systematic_violations(
+        self,
+        segment_id: str,
+        segment_text: str,
+        retrieved_snippets: List[Dict[str, Any]]
+    ) -> List[PolicyViolation]:
+        """Deterministic rule checks over a segment, grounded by retrieved policy snippets."""
+        violations: List[PolicyViolation] = []
+
+        def add_violation(severity: str, category: str, issue: str, recommendation: str):
+            circular = "BSP guidelines"
+            if retrieved_snippets:
+                circular = retrieved_snippets[0].get("circular_reference") or circular
+            violations.append(PolicyViolation(
+                severity=severity,
+                category=category,
+                location=segment_id,
+                issue=issue,
+                circular_reference=circular,
+                recommendation=recommendation,
+                original_text=segment_text[:320]
+            ))
+
+        text = segment_text or ""
+
+        # Rule 1: Absolute guarantees / certainty claims
+        if re.search(r'\b(guarantee|guaranteed|certain|definitely|never fail|will never|always)\b', text, re.IGNORECASE):
+            add_violation(
+                severity="high",
+                category="communication",
+                issue="Absolute or guaranteed outcome language detected.",
+                recommendation="Use conditional, risk-aware wording aligned with BSP communication standards."
+            )
+
+        # Rule 2: Forward guidance without qualifiers
+        if re.search(r'\b(will|shall|must)\b', text, re.IGNORECASE) and not self._has_qualifier(text):
+            add_violation(
+                severity="medium",
+                category="monetary_policy",
+                issue="Forward-looking language appears unqualified.",
+                recommendation="Add policy-consistent qualifiers (e.g., 'may', 'subject to data and risk conditions')."
+            )
+
+        # Rule 3: Endorsement language for specific vendors/tools
+        if re.search(r'\b(recommend|endors|best tool|preferred platform|official partner)\b', text, re.IGNORECASE):
+            add_violation(
+                severity="high",
+                category="regulatory",
+                issue="Potential endorsement-like language detected.",
+                recommendation="Reframe as neutral, illustrative reference and avoid endorsement implications."
+            )
+
+        # Rule 4: Overstated institutional mandate language
+        if re.search(r'\b(BSP\s+will\s+mandate|BSP\s+requires\s+all|we\s+will\s+impose)\b', text, re.IGNORECASE):
+            add_violation(
+                severity="critical",
+                category="regulatory",
+                issue="Potential overstatement of BSP mandate or policy authority.",
+                recommendation="Use formally accurate mandate framing and avoid preempting formal decisions."
+            )
+
+        return violations
+
+    async def check_policy_alignment_systematic(
+        self,
+        speech_content: str,
+        speech_metadata: Dict[str, Any],
+        top_k: int = 5,
+        max_segments: int = 12
+    ) -> PolicyCheckResult:
+        """
+        Systematic policy check:
+        1) segment speech
+        2) retrieve top-k policy snippets per segment
+        3) apply deterministic rules
+        4) compute deterministic score
+        """
+        print("\n" + "="*70)
+        print("BSP POLICY ALIGNMENT CHECK (SYSTEMATIC RETRIEVAL MODE)")
+        print("="*70)
+        print(f"\n🏛️ Retrieval mode: top_k={top_k}, max_segments={max_segments}")
+
+        segments = self._segment_speech(speech_content, max_segments=max_segments)
+        print(f"  Segments to review: {len(segments)}")
+
+        all_violations: List[PolicyViolation] = []
+        all_circulars = set()
+        segment_traces: List[Dict[str, Any]] = []
+        insufficient_evidence_segments: List[Dict[str, str]] = []
+
+        for segment in segments:
+            segment_id = segment["segment_id"]
+            segment_text = segment["text"]
+
+            retrieval_result = await self._retrieve_snippets_with_fallback(
+                segment_text=segment_text,
+                speech_metadata=speech_metadata,
+                top_k=top_k
+            )
+            snippets = retrieval_result.get("snippets", [])
+            retrieval_strategy = retrieval_result.get("strategy", "none")
+
+            for snippet in snippets:
+                circ = snippet.get("circular_reference")
+                if circ:
+                    all_circulars.add(circ)
+
+            segment_violations = self._find_systematic_violations(segment_id, segment_text, snippets)
+            all_violations.extend(segment_violations)
+
+            # IMPORTANT: retrieval miss is NOT a policy violation.
+            if not snippets:
+                insufficient_evidence_segments.append({
+                    "segment_id": segment_id,
+                    "reason": "No relevant policy snippets retrieved after fallback"
+                })
+
+            segment_traces.append({
+                "segment_id": segment_id,
+                "segment_text": segment_text[:280],
+                "retrieval_strategy": retrieval_strategy,
+                "retrieved_count": len(snippets),
+                "retrieved_snippets": snippets,
+                "violations_count": len(segment_violations)
+            })
+
+            print(f"  [{segment_id}] retrieved={len(snippets)} strategy={retrieval_strategy} violations={len(segment_violations)}")
+
+        severity_weights = {
+            "critical": 30,
+            "high": 18,
+            "medium": 10,
+            "low": 4
+        }
+        total_penalty = sum(severity_weights.get(v.severity, 10) for v in all_violations)
+        compliance_score = max(0.0, min(1.0, 1.0 - (total_penalty / 100.0)))
+
+        has_high_or_critical = any(v.severity in ["critical", "high"] for v in all_violations)
+        requires_revision = has_high_or_critical
+
+        if not all_violations:
+            overall_compliance = "compliant"
+        elif has_high_or_critical:
+            overall_compliance = "major_issues"
+        else:
+            overall_compliance = "minor_issues"
+
+        compliance_level = PolicyComplianceLevel.from_agent_response(overall_compliance, requires_revision)
+
+        commendations = []
+        if not all_violations:
+            commendations.append({"finding": "No deterministic policy rule violations detected.", "impact": "positive"})
+        elif compliance_score >= 0.90:
+            commendations.append({"finding": "Limited violations with manageable severity.", "impact": "positive"})
+
+        if insufficient_evidence_segments:
+            commendations.append({
+                "finding": f"{len(insufficient_evidence_segments)} segment(s) had insufficient retrieval evidence; not treated as policy violations.",
+                "impact": "informational"
+            })
+
+        result = PolicyCheckResult(
+            overall_compliance=overall_compliance,
+            compliance_score=compliance_score,
+            violations=all_violations,
+            commendations=commendations,
+            agent_analysis=json.dumps({
+                "mode": "systematic_retrieval",
+                "segment_traces": segment_traces,
+                "insufficient_evidence_segments": insufficient_evidence_segments
+            }, ensure_ascii=False),
+            circular_references=sorted(list(all_circulars)),
+            requires_revision=requires_revision,
+            timestamp=datetime.now().isoformat(),
+            compliance_level=compliance_level
+        )
+
+        self._display_summary(result)
+        return result
+
 
 async def check_speech_policy_alignment(
     speech_content: str,
@@ -769,9 +1133,15 @@ async def check_speech_policy_alignment(
     checker = PolicyChecker()
     
     try:
-        result = await checker.check_policy_alignment(
+        top_k = int(os.getenv("POLICY_RETRIEVAL_TOP_K", "5"))
+        max_segments = int(os.getenv("POLICY_MAX_SEGMENTS", "12"))
+
+        # Force systematic retrieval-grounded policy checking.
+        result = await checker.check_policy_alignment_systematic(
             speech_content=speech_content,
-            speech_metadata=speech_metadata
+            speech_metadata=speech_metadata,
+            top_k=top_k,
+            max_segments=max_segments
         )
         
         return {
@@ -785,10 +1155,14 @@ async def check_speech_policy_alignment(
             "violations": [
                 {
                     "severity": v.severity,
+                    "violation_type": v.category,
                     "category": v.category,
                     "location": v.location,
+                    "description": v.issue,
                     "issue": v.issue,
+                    "problematic_text": v.original_text,
                     "circular_reference": v.circular_reference,
+                    "suggested_fix": v.recommendation,
                     "recommendation": v.recommendation
                 }
                 for v in result.violations
