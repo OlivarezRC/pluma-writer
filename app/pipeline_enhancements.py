@@ -46,12 +46,17 @@ class PolicyComplianceLevel(Enum):
         
         compliance_lower = agent_compliance.lower().replace(" ", "_")
         
-        if "compliant" in compliance_lower and not requires_revision:
-            return PolicyComplianceLevel.COMPLIANT
-        elif "minor" in compliance_lower or (not requires_revision and "issues" not in compliance_lower):
-            return PolicyComplianceLevel.NEEDS_REVISION
-        elif "major" in compliance_lower or "non_compliant" in compliance_lower or "non-compliant" in compliance_lower:
+        if "major" in compliance_lower or "non_compliant" in compliance_lower or "non-compliant" in compliance_lower:
             return PolicyComplianceLevel.NON_COMPLIANT
+        if requires_revision:
+            return PolicyComplianceLevel.NEEDS_REVISION
+
+        # No revision required: treat compliant/minor_issues as approved.
+        if "compliant" in compliance_lower or "minor" in compliance_lower:
+            return PolicyComplianceLevel.COMPLIANT
+
+        if "issues" not in compliance_lower:
+            return PolicyComplianceLevel.COMPLIANT
         else:
             # Ambiguous case - require human review
             return PolicyComplianceLevel.NEEDS_HUMAN_REVIEW

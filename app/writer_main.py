@@ -3338,28 +3338,21 @@ async def process_with_iterative_refinement_and_style(
                     emit("stage_text", stage=7, text=f"Policy check failed: {policy_check_result.get('error', 'Unknown')}")
                     break
 
-                # Normalize policy decision to avoid conflicting records.
-                # Rule: score >= 95% => no revision needed; otherwise requires revision.
                 compliance_score = policy_check_result.get('compliance_score')
-                normalized_requires_revision = None
-                if isinstance(compliance_score, (int, float)):
-                    score_percent_rounded = round(compliance_score * 100, 1)
-                    normalized_requires_revision = score_percent_rounded < 95.0
-                    policy_check_result['requires_revision'] = normalized_requires_revision
+                violations = policy_check_result.get('violations', [])
+                has_high_or_critical = any(
+                    str(v.get('severity', '')).strip().lower() in {'high', 'critical'}
+                    for v in violations
+                )
+
+                effective_requires_revision = bool(policy_check_result.get('requires_revision')) or has_high_or_critical
+                policy_check_result['requires_revision'] = effective_requires_revision
+
+                # Preserve checker's compliance label when provided; fallback only if missing.
+                if not policy_check_result.get('overall_compliance'):
                     policy_check_result['overall_compliance'] = (
-                        'needs_revision' if normalized_requires_revision else 'approved'
+                        'needs_revision' if effective_requires_revision else 'approved'
                     )
-
-                effective_requires_revision = (
-                    normalized_requires_revision
-                    if normalized_requires_revision is not None
-                    else bool(policy_check_result.get('requires_revision'))
-                )
-
-                # Ensure displayed compliance label is always consistent with final decision.
-                policy_check_result['overall_compliance'] = (
-                    'needs_revision' if effective_requires_revision else 'approved'
-                )
 
                 print(f"\n✓ Policy alignment check complete")
                 print(f"  Compliance: {policy_check_result.get('overall_compliance').upper()}")
@@ -3368,12 +3361,13 @@ async def process_with_iterative_refinement_and_style(
                 emit("stage_metric", stage=7, key="Compliance", value=policy_check_result.get('overall_compliance', 'unknown').upper())
 
                 # Show violations summary
-                violations_count = policy_check_result.get('violations_count', 0)
+                violations_count = policy_check_result.get('violations_count', len(violations))
                 if violations_count > 0:
                     print(f"  Violations: {violations_count}")
-                    print(f"    Critical: {policy_check_result.get('critical_violations', 0)}")
-                    print(f"    High: {policy_check_result.get('high_violations', 0)}")
-                    violations = policy_check_result.get('violations', [])
+                    critical_count = sum(1 for v in violations if str(v.get('severity', '')).strip().lower() == 'critical')
+                    high_count = sum(1 for v in violations if str(v.get('severity', '')).strip().lower() == 'high')
+                    print(f"    Critical: {critical_count}")
+                    print(f"    High: {high_count}")
                     if violations:
                         print("  Violation details (top 5):")
                         emit("stage_text", stage=7, text="Policy violations detected (showing top 5)")
@@ -3427,7 +3421,7 @@ async def process_with_iterative_refinement_and_style(
                 # AUTO-FIX: Revise policy violations
                 violations = policy_check_result.get('violations', [])
 
-                # Build issues list for fix_speech_issues (always attempt fix when revision is required)
+                # Build issues list for fix_speech_issues (only when revision is truly required)
                 policy_issues = []
                 if violations:
                     print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(violations)} policy violations...")
