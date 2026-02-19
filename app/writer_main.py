@@ -1490,11 +1490,223 @@ def enforce_citation_discipline(text: str, max_ids_per_sentence: int = 2) -> str
     return ''.join(corrected_parts)
 
 
+def trim_text_to_boundary(text: str, max_length: int) -> str:
+    """Trim text to max_length without cutting citations/sentences mid-way when possible."""
+    if not text or len(text) <= max_length:
+        return text
+
+    raw_truncated = text[:max_length]
+
+    # If citation is cut mid-way, drop from the unmatched '[' onward
+    if raw_truncated.count('[') > raw_truncated.count(']'):
+        last_open_bracket = raw_truncated.rfind('[')
+        if last_open_bracket > 0:
+            raw_truncated = raw_truncated[:last_open_bracket].rstrip()
+
+    # Prefer ending on a natural sentence/citation boundary
+    candidate_boundaries = [
+        raw_truncated.rfind("]. "),
+        raw_truncated.rfind("].\n"),
+        raw_truncated.rfind(". "),
+        raw_truncated.rfind("? "),
+        raw_truncated.rfind("! "),
+        raw_truncated.rfind("]\n"),
+    ]
+    best_boundary = max(candidate_boundaries)
+
+    if best_boundary >= int(max_length * 0.6):
+        return raw_truncated[:best_boundary + 1].rstrip()
+
+    return raw_truncated.rstrip()
+
+
+def split_references_section(text: str) -> (str, str):
+    """Split text into (body, references_section). References section starts at a REFERENCES heading if present."""
+    if not text:
+        return "", ""
+
+    match = re.search(r'\n(?:=+\n)?\s*REFERENCES\s*\n(?:=+\n)?', text, flags=re.IGNORECASE)
+    if not match:
+        return text, ""
+
+    return text[:match.start()].rstrip(), text[match.start():]
+
+
+def strip_in_text_citations(text: str) -> str:
+    """Remove in-text citation tokens for effective length counting."""
+    if not text:
+        return ""
+
+    # [E1] / [E1,E2]
+    without_bracket_citations = re.sub(r'\[E\d+(?:,E\d+)*\]', '', text)
+
+    # APA-like parenthetical citations containing a year or n.d.
+    without_parenthetical_citations = re.sub(
+        r'\((?=[^)]*\b(?:\d{4}[a-z]?|n\.d\.)\b)[^)]*\)',
+        '',
+        without_bracket_citations,
+        flags=re.IGNORECASE
+    )
+
+    # Normalize spacing created by removals
+    normalized = re.sub(r'\s{2,}', ' ', without_parenthetical_citations)
+    return normalized.strip()
+
+
+def effective_speech_body_length(text: str) -> int:
+    """Length used for max-length policy: excludes references and in-text citations."""
+    body, _ = split_references_section(text)
+    return len(strip_in_text_citations(body))
+
+
+def trim_body_preserve_closing(text: str, max_length: int) -> str:
+    """Fallback trim that keeps opening and ending (closing remarks) when possible."""
+    if not text:
+        return text
+
+    if len(strip_in_text_citations(text)) <= max_length:
+        return text
+
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    if len(sentences) <= 3:
+        return trim_text_to_boundary(text, max_length)
+
+    first = sentences[0]
+    ending = sentences[-2:]
+    middle = sentences[1:-2]
+
+    # Remove middle content from the center outward until under effective limit
+    while middle and len(strip_in_text_citations(" ".join([first] + middle + ending))) > max_length:
+        remove_idx = len(middle) // 2
+        middle.pop(remove_idx)
+
+    candidate = " ".join([first] + middle + ending).strip()
+    if len(strip_in_text_citations(candidate)) <= max_length:
+        return candidate
+
+    return trim_text_to_boundary(candidate, max_length)
+
+
+async def smart_trim_speech_to_max_length(
+    speech_text: str,
+    max_length: int,
+    style_profile: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Reduce speech length using an LLM by removing least important content while preserving
+    message, style, tone, confidence, and citation fidelity.
+    """
+    if not speech_text:
+        return {
+            "success": False,
+            "error": "No speech text provided",
+            "trimmed_output": speech_text
+        }
+
+    speech_body, references_section = split_references_section(speech_text)
+
+    if len(strip_in_text_citations(speech_body)) <= max_length:
+        return {
+            "success": True,
+            "trimmed_output": speech_text,
+            "strategy": "no-op"
+        }
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
+            api_key=os.getenv("AZURE_OPENAI_KEY"),
+        )
+
+        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+
+        style_context = ""
+        if style_profile:
+            style_name = style_profile.get("name", "")
+            style_speaker = style_profile.get("speaker", "")
+            style_audience = style_profile.get("audience_setting_classification", "")
+            style_tone = style_profile.get("tone", "")
+
+            style_context = "\n<STYLE_TO_RETAIN>\n"
+            if style_name:
+                style_context += f"Style Name: {style_name}\n"
+            if style_speaker:
+                style_context += f"Speaker Persona: {style_speaker}\n"
+            if style_audience:
+                style_context += f"Audience: {style_audience}\n"
+            if style_tone:
+                style_context += f"Tone: {style_tone}\n"
+            style_context += "Retain rhetorical voice, cadence, confidence, and register.\n"
+            style_context += "</STYLE_TO_RETAIN>\n"
+
+        system_prompt = (
+            "You are a senior speech editor. Shorten the speech by removing the least important "
+            "details only. Preserve core message, factual meaning, argument flow, and speaker style. "
+            "Do not add new claims, policies, or disclaimers. Keep all citations already present "
+            "in retained sentences unchanged."
+        )
+
+        user_prompt = f"""{style_context}
+<CONSTRAINTS>
+- Target maximum length: {max_length} characters (hard limit).
+- Character limit applies to body only (exclude any REFERENCES section).
+- In-text citations do NOT count toward the character limit; preserve them anyway.
+- Keep opening and closing intact when possible.
+- Always end with brief closing remarks and a clear end greeting (e.g., "Thank you.").
+- Prefer trimming repetitive or lower-priority illustrative details.
+- Preserve confidence and clarity.
+- Return ONLY the revised speech text.
+</CONSTRAINTS>
+
+<SPEECH>
+{speech_body}
+</SPEECH>
+"""
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_completion_tokens=max(4000, min(12000, max_length * 6))
+        )
+
+        trimmed_output = (response.choices[0].message.content or "").strip()
+
+        if not trimmed_output:
+            return {
+                "success": False,
+                "error": "LLM returned empty trimmed output",
+                "trimmed_output": trim_body_preserve_closing(speech_body, max_length) + references_section
+            }
+
+        if len(strip_in_text_citations(trimmed_output)) > max_length:
+            trimmed_output = trim_body_preserve_closing(trimmed_output, max_length)
+
+        trimmed_output = trimmed_output + references_section
+
+        return {
+            "success": True,
+            "trimmed_output": trimmed_output,
+            "strategy": "llm-trim"
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "trimmed_output": trim_body_preserve_closing(speech_body, max_length) + references_section
+        }
+
+
 async def fix_speech_issues(
     speech_text: str,
     issues: List[Dict[str, Any]],
     evidence_store: List[Dict[str, Any]] = None,
-    issue_type: str = "generic"
+    issue_type: str = "generic",
+    style_profile: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Use LLM to automatically fix flagged issues in speech segments.
@@ -1508,6 +1720,7 @@ async def fix_speech_issues(
             - severity: CRITICAL/HIGH/MEDIUM/LOW
         evidence_store: List of evidence for citation context
         issue_type: Type of issues ("citation", "plagiarism", "policy", "generic")
+        style_profile: Optional selected style metadata to preserve voice and register
     
     Returns:
         {
@@ -1541,12 +1754,35 @@ async def fix_speech_issues(
             
             "plagiarism": """Rewrite text with high similarity to sources. Restructure sentences, use synonyms, change word order. Keep citations [ENN] intact. Preserve factual accuracy.""",
             
-            "policy": """Fix BSP policy violations. Add disclaimers for forward-looking statements, soften absolutes, add context. Use "BSP/we" not "I". Keep citations [ENN] intact. Maintain professional tone.""",
+            "policy": """Fix concrete BSP policy violations with targeted edits only. Do not add blanket disclaimer sections or legal boilerplate unless explicitly required by a listed issue. Preserve confidence, directness, and the speaker's rhetorical style; only soften language when a specific statement is unsupported, non-compliant, or misleading. Use "BSP/we" not "I". Keep citations [ENN] intact. Maintain professional tone.""",
             
             "generic": """Fix flagged issues. Preserve citations [ENN], maintain voice and facts."""
         }
         
         system_prompt = system_prompts.get(issue_type, system_prompts["generic"])
+
+        # Build style preservation context if available
+        style_context = ""
+        if style_profile:
+            style_name = style_profile.get("name", "")
+            style_speaker = style_profile.get("speaker", "")
+            style_audience = style_profile.get("audience_setting_classification", "")
+            style_tone = style_profile.get("tone", "")
+
+            style_context = "\n<STYLE_TO_PRESERVE>\n"
+            if style_name:
+                style_context += f"Style Name: {style_name}\n"
+            if style_speaker:
+                style_context += f"Speaker Persona: {style_speaker}\n"
+            if style_audience:
+                style_context += f"Audience: {style_audience}\n"
+            if style_tone:
+                style_context += f"Tone: {style_tone}\n"
+            style_context += (
+                "Preserve these style characteristics exactly: rhetorical voice, cadence, formality level, "
+                "opening/closing phrasing, and audience register.\n"
+            )
+            style_context += "</STYLE_TO_PRESERVE>\n"
         
         # Build evidence context if available
         evidence_context = ""
@@ -1568,7 +1804,15 @@ async def fix_speech_issues(
             issues_text += f"Severity: {issue.get('severity', 'MEDIUM')}\n"
         issues_text += "</ISSUES_TO_FIX>\n"
         
-        user_prompt = f"""{evidence_context}{issues_text}
+        user_prompt = f"""{evidence_context}{style_context}{issues_text}
+
+    <EDITING_RULES>
+    - Make the smallest possible edits needed to resolve the listed issues.
+    - Preserve original structure, paragraph flow, tone, confidence, and speaking style.
+    - Do not rewrite unaffected passages.
+    - Do not add a standalone disclaimer block unless the issue list explicitly requests one.
+    - Keep citation markers [ENN] exactly preserved.
+    </EDITING_RULES>
 
 <SPEECH_TO_REVISE>
 {speech_text}
@@ -1947,7 +2191,8 @@ JSON:"""
             "4. Maintain ALL citations from the original summary\n",
             "5. If you rephrase a sentence, keep its citation intact\n",
             "6. Multiple claims in one sentence = multiple citations [E1,E3,E7]\n",
-            "7. End with a short closing reflection (1-3 sentences) on why this topic matters to BSP, financial institutions, and the nation as a whole. Keep this aligned with available evidence and avoid unsupported claims.\n\n",
+            "7. End with a short closing reflection (1-3 sentences) on why this topic matters to BSP, financial institutions, and the nation as a whole. Keep this aligned with available evidence and avoid unsupported claims.\n",
+            "8. Finish with a clear closing greeting line (e.g., 'Thank you.' or 'Maraming salamat po.').\n\n",
             f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
         ])
         
@@ -1978,13 +2223,32 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
         # Keep completion token budget separate from output character cap.
         # max_output_length limits final characters (enforced after generation),
         # while completion tokens must leave room for GPT-5 reasoning + visible output.
-        completion_token_budget = max(8000, min(16000, max_output_length * 8))
+        # These can be tuned via environment variables if needed.
+        try:
+            min_completion_tokens = int(os.getenv("AZURE_OPENAI_MIN_COMPLETION_TOKENS", "12000"))
+        except ValueError:
+            min_completion_tokens = 12000
+
+        try:
+            max_completion_tokens = int(os.getenv("AZURE_OPENAI_MAX_COMPLETION_TOKENS", "24000"))
+        except ValueError:
+            max_completion_tokens = 24000
+
+        if max_completion_tokens < min_completion_tokens:
+            max_completion_tokens = min_completion_tokens
+
+        completion_token_budget = max(
+            min_completion_tokens,
+            min(max_completion_tokens, max_output_length * 10)
+        )
 
         # Log prompt lengths for debugging
         print(f"[DEBUG] System prompt length: {len(system_prompt)} chars")
         print(f"[DEBUG] User prompt length: {len(user_prompt)} chars")
         print(f"[DEBUG] Summary length: {len(summary)} chars")
-        print(f"[DEBUG] Max completion tokens: {completion_token_budget}")
+        print(f"[DEBUG] Min completion tokens: {min_completion_tokens}")
+        print(f"[DEBUG] Max completion tokens: {max_completion_tokens}")
+        print(f"[DEBUG] Completion token budget: {completion_token_budget}")
 
         # Generate styled output (GPT-5 needs more tokens due to reasoning)
         try:
@@ -2053,33 +2317,34 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "model_used": model
             }
         
-        # Truncate if needed (boundary-aware to avoid partial sentence/citation artifacts)
-        if len(styled_output) > max_output_length:
-            raw_truncated = styled_output[:max_output_length]
+        # If over max length, prioritize smart LLM trimming before hard truncation.
+        # Character limit applies to speech body only (references excluded).
+        body_text, references_section = split_references_section(styled_output)
+        body_length = len(body_text)
+        effective_body_length = len(strip_in_text_citations(body_text))
+        if effective_body_length > max_output_length:
+            print(f"[INFO] Output body exceeds max length ({body_length} raw chars, {effective_body_length} effective chars > {max_output_length}). Running smart trim fixer...")
+            trim_result = await smart_trim_speech_to_max_length(
+                speech_text=styled_output,
+                max_length=max_output_length,
+                style_profile=style
+            )
 
-            # If citation is cut mid-way, drop from the unmatched '[' onward
-            if raw_truncated.count('[') > raw_truncated.count(']'):
-                last_open_bracket = raw_truncated.rfind('[')
-                if last_open_bracket > 0:
-                    raw_truncated = raw_truncated[:last_open_bracket].rstrip()
-
-            # Prefer ending on a natural sentence/citation boundary
-            candidate_boundaries = [
-                raw_truncated.rfind("]. "),
-                raw_truncated.rfind("].\n"),
-                raw_truncated.rfind(". "),
-                raw_truncated.rfind("? "),
-                raw_truncated.rfind("! "),
-                raw_truncated.rfind("]\n"),
-            ]
-            best_boundary = max(candidate_boundaries)
-
-            if best_boundary >= int(max_output_length * 0.6):
-                styled_output = raw_truncated[:best_boundary + 1].rstrip()
+            if trim_result.get("success") and trim_result.get("trimmed_output"):
+                styled_output = trim_result["trimmed_output"]
+                body_after_trim, refs_after_trim = split_references_section(styled_output)
+                print(f"[INFO] Smart trim applied (body={len(body_after_trim)} raw chars, effective={len(strip_in_text_citations(body_after_trim))} chars, refs={len(refs_after_trim)} chars)")
             else:
-                styled_output = raw_truncated.rstrip()
+                print(f"[WARNING] Smart trim failed, using boundary-safe truncation fallback: {trim_result.get('error', 'Unknown error')}")
+                styled_output = trim_body_preserve_closing(body_text, max_output_length) + references_section
 
-            print(f"[INFO] Output truncated to max length with boundary-safe trim ({len(styled_output)} chars)")
+            body_after_trim, refs_after_trim = split_references_section(styled_output)
+            if len(strip_in_text_citations(body_after_trim)) > max_output_length:
+                body_after_trim = trim_body_preserve_closing(body_after_trim, max_output_length)
+                styled_output = body_after_trim + refs_after_trim
+
+            body_final, refs_final = split_references_section(styled_output)
+            print(f"[INFO] Final output length after trim enforcement (body={len(body_final)} raw chars, effective={len(strip_in_text_citations(body_final))} chars, refs={len(refs_final)} chars)")
         
         # IMPROVEMENT #5: Enforce citation discipline (max 2 IDs per sentence)
         print("[INFO] Enforcing citation discipline (max 2 IDs/sentence)...")
@@ -2104,6 +2369,8 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
         total_evidence = len(allowed_ids) if allowed_ids else 0
         coverage = (cited_count / total_evidence * 100) if total_evidence > 0 else 0
         
+        output_body, output_refs = split_references_section(styled_output)
+
         return {
             "success": True,
             "styled_output": styled_output,
@@ -2111,7 +2378,9 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             "speaker": style.get("speaker", "Unknown"),
             "audience": style.get("audience_setting_classification", "General"),
             "model_used": model,
-            "output_length": len(styled_output) if styled_output else 0,
+            "output_length": len(strip_in_text_citations(output_body)) if output_body else 0,
+            "output_length_raw": len(output_body) if output_body else 0,
+            "references_length": len(output_refs) if output_refs else 0,
             "max_length": max_output_length,
             "citations_found": len(citations_found),
             "unique_evidence_cited": cited_count,
@@ -2843,7 +3112,8 @@ async def process_with_iterative_refinement_and_style(
                     speech_text=styled_result.get("styled_output", ""),
                     issues=citation_issues,
                     evidence_store=cumulative_evidence,
-                    issue_type="citation"
+                    issue_type="citation",
+                    style_profile=style
                 )
                 
                 if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
@@ -2994,7 +3264,8 @@ async def process_with_iterative_refinement_and_style(
                         speech_text=styled_result.get("styled_output", ""),
                         issues=plagiarism_issues,
                         evidence_store=cumulative_evidence,
-                        issue_type="plagiarism"
+                        issue_type="plagiarism",
+                        style_profile=style
                     )
                     
                     if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
@@ -3183,7 +3454,8 @@ async def process_with_iterative_refinement_and_style(
                     speech_text=speech_to_check,
                     issues=policy_issues,
                     evidence_store=cumulative_evidence,
-                    issue_type="policy"
+                    issue_type="policy",
+                    style_profile=style
                 )
 
                 if fix_result.get("success") and fix_result.get("fixes_applied") > 0:

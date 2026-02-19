@@ -22,6 +22,37 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import os
 
+
+def speech_body_length(text: str) -> int:
+    """Return character count excluding references and in-text citations."""
+    if not text:
+        return 0
+
+    import re
+    match = re.search(r'\n(?:=+\n)?\s*REFERENCES\s*\n(?:=+\n)?', text, flags=re.IGNORECASE)
+    body_text = text if not match else text[:match.start()].rstrip()
+
+    # [E1] / [E1,E2]
+    body_text = re.sub(r'\[E\d+(?:,E\d+)*\]', '', body_text)
+    # APA-like parenthetical citations containing a year or n.d.
+    body_text = re.sub(r'\((?=[^)]*\b(?:\d{4}[a-z]?|n\.d\.)\b)[^)]*\)', '', body_text, flags=re.IGNORECASE)
+    body_text = re.sub(r'\s{2,}', ' ', body_text).strip()
+
+    return len(body_text)
+
+
+def speech_body_raw_length(text: str) -> int:
+    """Return raw body character count excluding a REFERENCES section only."""
+    if not text:
+        return 0
+
+    import re
+    match = re.search(r'\n(?:=+\n)?\s*REFERENCES\s*\n(?:=+\n)?', text, flags=re.IGNORECASE)
+    if not match:
+        return len(text)
+
+    return len(text[:match.start()].rstrip())
+
 # --- UI helper: centered "OR" header with lines ---
 def or_header(text: str):
     st.markdown(
@@ -134,7 +165,7 @@ with col1:
         key="context_details",
     )
 
-    MIN_LEN, MAX_LEN, DEFAULT_LEN = 20, 75_000, 1_000
+    MIN_LEN, MAX_LEN, DEFAULT_LEN = 200, 75_000, 6_000
 
     # One source of truth
     st.session_state.setdefault("max_len", DEFAULT_LEN)
@@ -877,8 +908,8 @@ if st.button(
         # Capture selected iteration count on the main thread (thread-safe)
         selected_max_iterations = int(st.session_state.get("max_iterations", 3))
         selected_max_iterations = max(1, min(7, selected_max_iterations))
-        selected_max_output_length = int(st.session_state.get("max_len", 1000))
-        selected_max_output_length = max(20, min(75000, selected_max_output_length))
+        selected_max_output_length = int(st.session_state.get("max_len", 6000))
+        selected_max_output_length = max(200, min(75000, selected_max_output_length))
         stage_store[1]["lines"].append(f"Configured iterations: {selected_max_iterations}")
 
         def worker():
@@ -1129,7 +1160,8 @@ if st.button(
 
                     stage_store[3]["generated_output"] = styled_output
                     stage_store[3]["metrics"] = {
-                        "Output Length": len(styled_output) if styled_output else 0,
+                        "Effective Length": speech_body_length(styled_output),
+                        "Raw Length": speech_body_raw_length(styled_output),
                         "Citations": (styled_payload or {}).get("citations_found", 0) if isinstance(styled_payload, dict) else 0,
                         "Evidence IDs": (styled_payload or {}).get("unique_evidence_cited", 0) if isinstance(styled_payload, dict) else 0,
                     }
@@ -1599,13 +1631,15 @@ if st.button(
                     styled_output = results['styled_output']['styled_output']
                     
                     # Show key metrics
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
-                        st.metric("Output Length", f"{len(styled_output)} chars")
+                        st.metric("Effective Length", f"{speech_body_length(styled_output)} chars")
                     with col2:
+                        st.metric("Raw Length", f"{speech_body_raw_length(styled_output)} chars")
+                    with col3:
                         citations = results['styled_output'].get('citations_found', 0)
                         st.metric("Citations", citations)
-                    with col3:
+                    with col4:
                         evidence = results['styled_output'].get('unique_evidence_cited', 0)
                         st.metric("Evidence IDs", evidence)
                     
