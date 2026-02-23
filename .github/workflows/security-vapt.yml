@@ -1,0 +1,48 @@
+name: Security VAPT Baseline
+
+on:
+  push:
+    branches: [ main, replace-main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  sast-and-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install bandit pip-audit detect-secrets
+
+      - name: Bandit SAST
+        run: |
+          bandit -r app deep_research pages app.py -x __pycache__,venv,.venv
+
+      - name: Dependency CVE scan
+        run: |
+          pip-audit -r requirements.txt
+
+      - name: Secret scan
+        run: |
+          detect-secrets scan --all-files --exclude-files '^(venv|\.venv|__pycache__|\.git|data/).*' > .secrets.baseline.ci
+          test -s .secrets.baseline.ci
+
+      - name: Upload security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-baseline
+          path: |
+            .secrets.baseline.ci

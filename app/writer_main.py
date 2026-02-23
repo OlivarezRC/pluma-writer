@@ -4310,7 +4310,7 @@ async def process_with_iterative_refinement_and_style(
             
             # Prepare speech metadata
             speech_metadata = {
-                "id": hashlib.md5(styled_result.get("styled_output", "").encode()).hexdigest()[:16],
+                "id": hashlib.sha256(styled_result.get("styled_output", "").encode()).hexdigest()[:16],
                 "query": query,
                 "speaker": style.get("speaker") if style else None,
                 "institution": "Analysis",

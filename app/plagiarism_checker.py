@@ -135,7 +135,7 @@ class TextNormalizer:
             verbose: Print progress information
         """
         if not speech_id:
-            speech_id = hashlib.md5(text.encode()).hexdigest()[:8]
+            speech_id = hashlib.sha256(text.encode()).hexdigest()[:8]
         
         # Preprocess
         text = TextNormalizer.remove_headers_footers(text)
@@ -709,7 +709,7 @@ class PlagiarismChecker:
             # Create chunks from source
             chunks = TextNormalizer.create_chunks(
                 content,
-                speech_id=hashlib.md5(source['url'].encode()).hexdigest()[:8],
+                speech_id=hashlib.sha256(source['url'].encode()).hexdigest()[:8],
                 chunk_by="paragraph"
             )
             print(f"    Source {idx}: '{source['title'][:50]}...' → {len(chunks)} chunks")

@@ -95,125 +95,156 @@ st.text_input(
     key="research_query"
 )
 
-st.info(
-    "Provide at least one source type: **Keywords (for Deep Research)**, **Source Links (URLs)**, or **Upload Attachments**."
+with st.container(border=True):
+    st.info(
+        "Provide at least one source type: **Keywords (for Deep Research)**, **Source Links (URLs)**, or **Upload Attachments**."
+    )
+
+    # --- two-column layout (Col 1 / Col 2) ---
+    col1, col2 = st.columns([3, 2], gap="small")
+
+    with col1:
+        # Topics/Keywords for deep research
+        st.text_area(
+            ":blue[**Keywords (for Deep Research):**]",
+            value=st.session_state.get("research_topics", ""),
+            height=120,
+            help="Space-separated keywords for deep research (e.g., 'AI artificial intelligence machine learning financial portfolio risk prediction')",
+            key="research_topics",
+        )
+
+        # Dynamic Source Links
+        st.markdown(":blue[**Source Links (URLs):**]")
+        
+        # Initialize source links in session state
+        if "source_links" not in st.session_state:
+            st.session_state.source_links = [""]
+        
+        # Display existing links with remove buttons
+        links_to_remove = []
+        for i, link in enumerate(st.session_state.source_links):
+            col_link, col_btn = st.columns([5, 1])
+            with col_link:
+                new_link = st.text_input(
+                    f"Link {i+1}",
+                    value=link,
+                    key=f"link_input_{i}",
+                    label_visibility="collapsed",
+                    placeholder="https://example.com/article"
+                )
+                st.session_state.source_links[i] = new_link
+            with col_btn:
+                if st.button("🗑️", key=f"remove_link_{i}", help="Remove this link"):
+                    links_to_remove.append(i)
+        
+        # Remove marked links
+        for i in reversed(links_to_remove):
+            st.session_state.source_links.pop(i)
+        
+        # Add new link button
+        if st.button("➕ Add Source Link", key="add_link"):
+            st.session_state.source_links.append("")
+            st.rerun()
+
+        # Source readiness block (moved directly below Source Links)
+        query_filled = bool(st.session_state.get("research_query", "").strip())
+        topics_filled = bool(st.session_state.get("research_topics", "").strip())
+        links_filled = any(link.strip() for link in st.session_state.get("source_links", []))
+        attachments_filled = bool(st.session_state.get("content_upload"))
+        has_any_source = topics_filled or links_filled or attachments_filled
+
+        if not query_filled and not has_any_source:
+            readiness_footer = "You haven't filled either of the three source types and Research Query / Speech Topic"
+        elif not query_filled:
+            readiness_footer = "You still don't have a Research Query / Speech Topic:"
+        elif not has_any_source:
+            readiness_footer = "You still haven't filled either of the three source types"
+        else:
+            readiness_footer = "✅ Requirements satisfied."
+
+        readiness_text = (
+            ("You are good to go!" if (query_filled and has_any_source) else "Either add a Topics / Keywords to be used for deep research, source links to be searched, or upload attachments to be extracted.") + "\n\n"
+            f"- {'✅' if query_filled else '⬜'} Research Query / Speech Topic\n"
+            f"- {'✅' if topics_filled else '⬜'} Topics / Keywords\n"
+            f"- {'✅' if links_filled else '⬜'} Source Links\n"
+            f"- {'✅' if attachments_filled else '⬜'} Upload Attachments\n\n"
+            f"{readiness_footer}"
+        )
+
+        if query_filled and has_any_source:
+            st.success(readiness_text)
+        elif not query_filled:
+            st.info(readiness_text)
+        else:
+            st.warning(readiness_text)
+
+    with col2:
+        uploaded_files = st.file_uploader(
+            ":blue[**Upload Attachments:**]",
+            type=["pdf", "docx", "pptx"],
+            accept_multiple_files=True,
+            help="Upload PDF, Word, or PowerPoint files as reference materials",
+            key="content_upload",
+        )
+
+st.text_area(
+    ":blue[**Setting / Location / Conference / Partners (Optional):**]",
+    st.session_state.get("context_details", ""),
+    height=90,
+    help="Optional context to guide greetings and speech considerations.",
+    key="context_details",
 )
 
+MIN_LEN, MAX_LEN, DEFAULT_LEN = 200, 75_000, 6_000
 
-# --- two-column layout (Col 1 / Col 2) ---
-col1, col2 = st.columns([3, 2], gap="small")
+# One source of truth
+st.session_state.setdefault("max_len", DEFAULT_LEN)
+st.session_state.setdefault("last_updated", None)
 
-with col1:
-    # Topics/Keywords for deep research
-    st.text_area(
-        ":blue[**Keywords (for Deep Research):**]",
-        value=st.session_state.get("research_topics", ""),
-        height=120,
-        help="Space-separated keywords for deep research (e.g., 'AI artificial intelligence machine learning financial portfolio risk prediction')",
-        key="research_topics",
+def _update_from_slider():
+    st.session_state.last_updated = "slider"
+    st.session_state.max_len = st.session_state.max_len_slider
+
+def _update_from_input():
+    st.session_state.last_updated = "input"
+    v = st.session_state.max_len_input
+    # Coerce + clamp
+    try:
+        v = int(v)
+    except Exception:
+        v = MIN_LEN
+    st.session_state.max_len = max(MIN_LEN, min(MAX_LEN, v))
+
+# Keep both widgets synced to the source of truth (avoid ping-pong)
+if st.session_state.last_updated != "slider":
+    st.session_state["max_len_slider"] = st.session_state.max_len
+if st.session_state.last_updated != "input":
+    st.session_state["max_len_input"] = st.session_state.max_len
+
+col_slider, col_input = st.columns([3, 1])
+
+with col_slider:
+    st.slider(
+        ":blue[**Output Maximum Character Length (75,000 Maximum):**]",
+        min_value=MIN_LEN,
+        max_value=MAX_LEN,
+        key="max_len_slider",
+        on_change=_update_from_slider,
+        disabled=False,
     )
 
-    # Dynamic Source Links
-    st.markdown(":blue[**Source Links (URLs):**]")
-    
-    # Initialize source links in session state
-    if "source_links" not in st.session_state:
-        st.session_state.source_links = [""]
-    
-    # Display existing links with remove buttons
-    links_to_remove = []
-    for i, link in enumerate(st.session_state.source_links):
-        col_link, col_btn = st.columns([5, 1])
-        with col_link:
-            new_link = st.text_input(
-                f"Link {i+1}",
-                value=link,
-                key=f"link_input_{i}",
-                label_visibility="collapsed",
-                placeholder="https://example.com/article"
-            )
-            st.session_state.source_links[i] = new_link
-        with col_btn:
-            if st.button("🗑️", key=f"remove_link_{i}", help="Remove this link"):
-                links_to_remove.append(i)
-    
-    # Remove marked links
-    for i in reversed(links_to_remove):
-        st.session_state.source_links.pop(i)
-    
-    # Add new link button
-    if st.button("➕ Add Source Link", key="add_link"):
-        st.session_state.source_links.append("")
-        st.rerun()
-
-    st.text_area(
-        ":blue[**Setting / Location / Conference / Partners (Optional):**]",
-        st.session_state.get("context_details", ""),
-        height=90,
-        help="Optional context to guide greetings and speech considerations.",
-        key="context_details",
+with col_input:
+    st.number_input(   # use number_input for clean integer UX
+        "No. of Characters",
+        min_value=MIN_LEN,
+        max_value=MAX_LEN,
+        step=1,
+        key="max_len_input",
+        on_change=_update_from_input,
     )
 
-    MIN_LEN, MAX_LEN, DEFAULT_LEN = 200, 75_000, 6_000
-
-    # One source of truth
-    st.session_state.setdefault("max_len", DEFAULT_LEN)
-    st.session_state.setdefault("last_updated", None)
-
-    def _update_from_slider():
-        st.session_state.last_updated = "slider"
-        st.session_state.max_len = st.session_state.max_len_slider
-
-    def _update_from_input():
-        st.session_state.last_updated = "input"
-        v = st.session_state.max_len_input
-        # Coerce + clamp
-        try:
-            v = int(v)
-        except Exception:
-            v = MIN_LEN
-        st.session_state.max_len = max(MIN_LEN, min(MAX_LEN, v))
-
-    # Keep both widgets synced to the source of truth (avoid ping-pong)
-    if st.session_state.last_updated != "slider":
-        st.session_state["max_len_slider"] = st.session_state.max_len
-    if st.session_state.last_updated != "input":
-        st.session_state["max_len_input"] = st.session_state.max_len
-
-    col_slider, col_input = st.columns([3, 1])
-
-    with col_slider:
-        st.slider(
-            ":blue[**Output Maximum Character Length (75,000 Maximum):**]",
-            min_value=MIN_LEN,
-            max_value=MAX_LEN,
-            key="max_len_slider",
-            on_change=_update_from_slider,
-            disabled=False,
-        )
-
-    with col_input:
-        st.number_input(   # use number_input for clean integer UX
-            "No. of Characters",
-            min_value=MIN_LEN,
-            max_value=MAX_LEN,
-            step=1,
-            key="max_len_input",
-            on_change=_update_from_input,
-        )
-
-    # Use this in your app
-    max_output_length = st.session_state.max_len
-
-with col2:
-    
-    uploaded_files = st.file_uploader(
-        ":blue[**Upload Attachments:**]",
-        type=["pdf", "docx", "pptx"],
-        accept_multiple_files=True,
-        help="Upload PDF, Word, or PowerPoint files as reference materials",
-        key="content_upload",
-    )
+# Use this in your app
+max_output_length = st.session_state.max_len
 
 # Extract text from uploaded files as attachments
 attachment_contents = []
@@ -262,38 +293,6 @@ if attachment_contents:
                 key=f"preview_{att['filename']}",
                 disabled=True
             )
-
-# Source readiness block
-query_filled = bool(st.session_state.get("research_query", "").strip())
-topics_filled = bool(st.session_state.get("research_topics", "").strip())
-links_filled = any(link.strip() for link in st.session_state.get("source_links", []))
-attachments_filled = len(attachment_contents) > 0
-has_any_source = topics_filled or links_filled or attachments_filled
-
-if not query_filled and not has_any_source:
-    readiness_footer = "You haven't filled either of the three source types and Research Query / Speech Topic"
-elif not query_filled:
-    readiness_footer = "You still don't have a Research Query / Speech Topic:"
-elif not has_any_source:
-    readiness_footer = "You still haven't filled either of the three source types"
-else:
-    readiness_footer = "✅ Requirements satisfied."
-
-readiness_text = (
-    ("You are good to go!" if (query_filled and has_any_source) else "Either add a Topics / Keywords to be used for deep research, source links to be searched, or upload attachments to be extracted.") + "\n\n"
-    f"- {'✅' if query_filled else '⬜'} Research Query / Speech Topic\n"
-    f"- {'✅' if topics_filled else '⬜'} Topics / Keywords\n"
-    f"- {'✅' if links_filled else '⬜'} Source Links\n"
-    f"- {'✅' if attachments_filled else '⬜'} Upload Attachments\n\n"
-    f"{readiness_footer}"
-)
-
-if query_filled and has_any_source:
-    st.success(readiness_text)
-elif not query_filled:
-    st.info(readiness_text)
-else:
-    st.warning(readiness_text)
 
 # Extracting the styles and creating combined display options
 styles_data = utils.get_styles()
