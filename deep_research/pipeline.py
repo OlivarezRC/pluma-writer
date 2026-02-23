@@ -15,7 +15,7 @@ from .formatting import deduplicate_and_format_sources, format_sources
 from .states import SummaryState, SummaryStateInput, SummaryStateOutput
 
 # Model initialization - lazy loaded to avoid import-time connection
-_deep_seek_models: Dict[str, AzureAIChatCompletionsModel] = {}
+_deep_research_models: Dict[str, AzureAIChatCompletionsModel] = {}
 
 
 def _get_max_research_loops() -> int:
@@ -29,7 +29,7 @@ def _get_max_research_loops() -> int:
 
 def _get_model(task_tier: str = "light"):
     """
-    Lazy initialization of DeepSeek model.
+    Lazy initialization of deep-research model.
     Validates environment variables and initializes model on first use.
     
     Returns:
@@ -39,14 +39,14 @@ def _get_model(task_tier: str = "light"):
         ValueError: If required environment variables are missing
     """
     model_map = {
-        "light": os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
-        "summary": os.getenv("DEEP_RESEARCH_SUMMARY_DEPLOYMENT") or os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
-        "default": os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
+        "light": os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
+        "summary": os.getenv("DEEP_RESEARCH_SUMMARY_DEPLOYMENT") or os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
+        "default": os.getenv("AZURE_DR_DEPLOYMENT"),
     }
     _model_name = model_map.get(task_tier, model_map["light"])
 
-    if _model_name in _deep_seek_models:
-        return _deep_seek_models[_model_name]
+    if _model_name in _deep_research_models:
+        return _deep_research_models[_model_name]
     
     # Get environment variables
     _endpoint = os.getenv("AZURE_INFERENCE_ENDPOINT")
@@ -56,7 +56,7 @@ def _get_model(task_tier: str = "light"):
     if not _endpoint or not _model_name or not _key:
         missing = []
         if not _endpoint: missing.append("AZURE_INFERENCE_ENDPOINT")
-        if not _model_name: missing.append("AZURE_DEEPSEEK_DEPLOYMENT")
+        if not _model_name: missing.append("AZURE_DR_DEPLOYMENT")
         if not _key: missing.append("AZURE_AI_API_KEY")
         raise ValueError(
             f"Missing required environment variables for deep research: {', '.join(missing)}. "
@@ -71,7 +71,7 @@ def _get_model(task_tier: str = "light"):
         model=_model_name,
     )
 
-    _deep_seek_models[_model_name] = model_instance
+    _deep_research_models[_model_name] = model_instance
     return model_instance
 
 # notifier: async callback(event_name:str, payload:dict) -> None

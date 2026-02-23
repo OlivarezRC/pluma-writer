@@ -393,8 +393,8 @@ def _get_link_processing_model(tier: str = "light"):
         ValueError: If required environment variables are missing
     """
     deployment_by_tier = {
-        "light": os.getenv("AZURE_INFERENCE_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
-        "strong": os.getenv("AZURE_INFERENCE_STRONG_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
+        "light": os.getenv("AZURE_INFERENCE_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
+        "strong": os.getenv("AZURE_INFERENCE_STRONG_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
     }
 
     _model_name = deployment_by_tier.get(tier, deployment_by_tier["light"])
@@ -411,7 +411,7 @@ def _get_link_processing_model(tier: str = "light"):
     if not _endpoint or not _model_name or not _key:
         missing = []
         if not _endpoint: missing.append("AZURE_INFERENCE_ENDPOINT")
-        if not _model_name: missing.append("AZURE_DEEPSEEK_DEPLOYMENT")
+        if not _model_name: missing.append("AZURE_DR_DEPLOYMENT")
         if not _key: missing.append("AZURE_AI_API_KEY")
         raise ValueError(
             f"Missing required environment variables for link processing: {', '.join(missing)}. "
@@ -2351,7 +2351,11 @@ async def smart_trim_speech_to_max_length(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
 
-        model = os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = (
+            os.getenv("AZURE_OPENAI_STAGE3_EDIT_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        )
 
         style_context = ""
         if style_profile:
@@ -2478,7 +2482,11 @@ async def fix_speech_issues(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
         
-        model = os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = (
+            os.getenv("AZURE_OPENAI_STAGE3_EDIT_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        )
         
         # Build issue-specific system prompt
         system_prompts = {
@@ -2663,7 +2671,7 @@ async def generate_styled_output(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
         
-        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = os.getenv("AZURE_OPENAI_STAGE3_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
         
         # Extract compact style digest (cached) to reduce prompt size/cost
         style_digest = build_style_digest(style)
@@ -3559,7 +3567,12 @@ async def verify_styled_citations(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
 
-    verification_model = os.getenv("AZURE_OPENAI_VERIFICATION_DEPLOYMENT", "gpt-4o-mini")
+    verification_model = (
+        os.getenv("AZURE_OPENAI_STAGE4_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_VERIFICATION_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_CHAT_MINI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
     use_llm_for_uncertain = os.getenv("WRITER_VERIFY_USE_LLM", "true").strip().lower() in {"1", "true", "yes", "on"}
     token_usage_summary = {
         "prompt_tokens": 0,
