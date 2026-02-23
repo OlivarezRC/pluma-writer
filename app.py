@@ -146,17 +146,6 @@ with col1:
         st.session_state.source_links.append("")
         st.rerun()
 
-    # Max iterations for Stage 1 iterative refinement
-    st.number_input(
-        ":blue[**Research iterations:**]",
-        min_value=1,
-        max_value=7,
-        value=st.session_state.get("max_iterations", 3),
-        step=1,
-        help="Number of iterative research cycles (1-7). More iterations = more comprehensive but slower.",
-        key="max_iterations"
-    )
-
     st.text_area(
         ":blue[**Setting / Location / Conference / Partners (Optional):**]",
         st.session_state.get("context_details", ""),
@@ -905,12 +894,10 @@ if st.button(
             for i in range(1, 8):
                 render_stage(i)
 
-        # Capture selected iteration count on the main thread (thread-safe)
-        selected_max_iterations = int(st.session_state.get("max_iterations", 3))
-        selected_max_iterations = max(1, min(7, selected_max_iterations))
+        # Iterations are now selected automatically inside the writer pipeline
         selected_max_output_length = int(st.session_state.get("max_len", 6000))
         selected_max_output_length = max(200, min(75000, selected_max_output_length))
-        stage_store[1]["lines"].append(f"Configured iterations: {selected_max_iterations}")
+        stage_store[1]["lines"].append("Configured iterations: auto (writer-selected)")
 
         def worker():
             try:
@@ -925,6 +912,39 @@ if st.button(
                     t = text.strip()
                     if not t:
                         return
+
+                    # Explicit routing first to avoid stage confusion during nested/escalated flows.
+                    stage1_markers = [
+                        "ITERATION ",
+                        "Evidence IDs starting at",
+                        "Link processing:",
+                        "Topic processing:",
+                        "Attachment processing:",
+                        "Generating critique",
+                        "Generating adjustments",
+                        "Next iteration will use refined query",
+                        "Total evidence collected",
+                        "Cumulative Evidence",
+                    ]
+                    if any(k in t for k in stage1_markers):
+                        emit_text(1, t)
+
+                    stage3_markers = [
+                        "Fetching sample speeches",
+                        "Fetched",
+                        "Speech 1:",
+                        "Speech 2:",
+                        "Speech 3:",
+                        "Styled output generated successfully",
+                        "Style applied:",
+                        "Output length:",
+                        "All citations valid",
+                    ]
+                    if any(k in t for k in stage3_markers):
+                        emit_text(3, t)
+                    if "Content received, first 100 chars:" in t:
+                        preview = t.split("Content received, first 100 chars:", 1)[-1].strip()
+                        event_queue.put({"type": "stage_preview", "stage": 3, "text": preview})
 
                     if "STEP 1:" in t or "ITERATIVE REFINEMENT" in t:
                         current_stage = 1
@@ -945,8 +965,9 @@ if st.button(
                     if current_stage == 1:
                         if any(k in t for k in [
                             "Evidence IDs starting at",
-                            "Extracted",
                             "Link processing:",
+                            "Topic processing:",
+                            "Attachment processing:",
                             "Generating critique",
                             "Generating adjustments",
                             "Next iteration will use refined query",
@@ -1061,7 +1082,7 @@ if st.button(
                     process_with_iterative_refinement_and_style(
                         query=user_query,
                         sources=sources,
-                        max_iterations=selected_max_iterations,
+                        max_iterations=None,
                         max_output_length=selected_max_output_length,
                         context_details=context_details,
                         style=selected_style if selected_style else None,
@@ -1600,12 +1621,11 @@ if st.button(
         
         # Run the complete pipeline
         try:
-            user_max_iterations = st.session_state.get("max_iterations", 3)
             results = asyncio.run(
                 process_with_iterative_refinement_and_style(
                     query=user_query,
                     sources=sources,
-                    max_iterations=user_max_iterations,
+                    max_iterations=None,
                     context_details=context_details,
                     style=selected_style if selected_style else None,
                     enable_policy_check=True

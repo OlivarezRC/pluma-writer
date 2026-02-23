@@ -15,9 +15,19 @@ from .formatting import deduplicate_and_format_sources, format_sources
 from .states import SummaryState, SummaryStateInput, SummaryStateOutput
 
 # Model initialization - lazy loaded to avoid import-time connection
-_deep_seek_model = None
+_deep_seek_models: Dict[str, AzureAIChatCompletionsModel] = {}
 
-def _get_model():
+
+def _get_max_research_loops() -> int:
+    """Get maximum deep-research web loops from env, with safe defaults."""
+    raw_value = os.getenv("DEEP_RESEARCH_MAX_LOOPS", "3")
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        parsed = 3
+    return max(1, min(7, parsed))
+
+def _get_model(task_tier: str = "light"):
     """
     Lazy initialization of DeepSeek model.
     Validates environment variables and initializes model on first use.
@@ -28,14 +38,18 @@ def _get_model():
     Raises:
         ValueError: If required environment variables are missing
     """
-    global _deep_seek_model
-    
-    if _deep_seek_model is not None:
-        return _deep_seek_model
+    model_map = {
+        "light": os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
+        "summary": os.getenv("DEEP_RESEARCH_SUMMARY_DEPLOYMENT") or os.getenv("DEEP_RESEARCH_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
+        "default": os.getenv("AZURE_DEEPSEEK_DEPLOYMENT"),
+    }
+    _model_name = model_map.get(task_tier, model_map["light"])
+
+    if _model_name in _deep_seek_models:
+        return _deep_seek_models[_model_name]
     
     # Get environment variables
     _endpoint = os.getenv("AZURE_INFERENCE_ENDPOINT")
-    _model_name = os.getenv("AZURE_DEEPSEEK_DEPLOYMENT")
     _key = os.getenv("AZURE_AI_API_KEY")
     
     # Validate required environment variables
@@ -51,13 +65,14 @@ def _get_model():
     
     # Initialize model
     # Note: Use 'model' parameter, NOT 'model_name' for Azure AI Inference compatibility
-    _deep_seek_model = AzureAIChatCompletionsModel(
+    model_instance = AzureAIChatCompletionsModel(
         endpoint=_endpoint,
         credential=AzureKeyCredential(_key),
         model=_model_name,
     )
-    
-    return _deep_seek_model
+
+    _deep_seek_models[_model_name] = model_instance
+    return model_instance
 
 # notifier: async callback(event_name:str, payload:dict) -> None
 Notifier = Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]]
@@ -94,7 +109,7 @@ async def generate_query(state: SummaryState, notify: Notifier = None):
         current_date=current_date, research_topic=state.research_topic
     )
     messages = [SystemMessage(content=prompt), HumanMessage(content="Generate a query for web search:")]
-    model = _get_model()
+    model = _get_model("light")
     result = await model.ainvoke(messages)
     thoughts, text = _strip_thinking_tokens(result.content)
     text = _normalize_latex(text)
@@ -139,7 +154,7 @@ async def summarize_sources(state: SummaryState, notify: Notifier = None):
             f"Create a Summary using the Context on this topic:\n<User Input>\n{state.research_topic}\n</User Input>\n\n")
 
     messages = [SystemMessage(content=summarizer_instructions), HumanMessage(content=human)]
-    model = _get_model()
+    model = _get_model("summary")
     result = await model.ainvoke(messages)
     thoughts, text = _strip_thinking_tokens(result.content)
     text = _normalize_latex(text)
@@ -148,7 +163,7 @@ async def summarize_sources(state: SummaryState, notify: Notifier = None):
     return {"running_summary": text}
 
 async def reflect_on_summary(state: SummaryState, notify: Notifier = None):
-    model = _get_model()
+    model = _get_model("light")
     result = await model.ainvoke([
         SystemMessage(content=reflection_instructions.format(research_topic=state.research_topic)),
         HumanMessage(content=f"Reflect on our existing knowledge:\n===\n{state.running_summary}\n===\nAnd now identify a knowledge gap and generate a follow-up web search query:")
@@ -232,12 +247,17 @@ def setup_graph(notify: Notifier = None):        # ✅ accept notify here
 
     # ❗ no notify param here
     async def route_research(state: SummaryState):
-        if state.research_loop_count <= 3:
+        max_loops = _get_max_research_loops()
+        if state.research_loop_count < max_loops:
             if notify:
                 await notify("routing", {"decision": "continue", "loop_count": state.research_loop_count})
             return "web_research"
         if notify:
-            await notify("routing", {"decision": "finalize", "loop_count": state.research_loop_count})
+            await notify("routing", {
+                "decision": "finalize",
+                "loop_count": state.research_loop_count,
+                "max_loops": max_loops,
+            })
         return "finalize_summary"
 
     builder.add_conditional_edges("reflect_on_summary", route_research)
