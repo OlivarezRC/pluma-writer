@@ -893,11 +893,70 @@ class PolicyChecker:
         unique_terms = list(dict.fromkeys(filtered))
         return " ".join(unique_terms[:max_terms])
 
+    def _is_transient_policy_error(self, error: Exception) -> bool:
+        text = str(error or "").lower()
+        transient_markers = [
+            "too many requests", "429", "rate limit", "tempor", "timeout",
+            "connection", "reset", "503", "502", "504", "something went wrong"
+        ]
+        return any(marker in text for marker in transient_markers)
+
+    async def _retrieve_policy_snippets_with_retry(
+        self,
+        segment_text: str,
+        speech_metadata: Dict[str, Any],
+        top_k: int,
+        attempt_label: str,
+    ) -> List[Dict[str, Any]]:
+        try:
+            max_retries = int(os.getenv("POLICY_RETRIEVAL_MAX_RETRIES", "2"))
+        except ValueError:
+            max_retries = 2
+        max_retries = max(0, min(5, max_retries))
+
+        try:
+            base_delay_ms = int(os.getenv("POLICY_RETRIEVAL_RETRY_BASE_MS", "700"))
+        except ValueError:
+            base_delay_ms = 700
+        base_delay_ms = max(100, min(5000, base_delay_ms))
+
+        try:
+            max_delay_ms = int(os.getenv("POLICY_RETRIEVAL_RETRY_MAX_MS", "5000"))
+        except ValueError:
+            max_delay_ms = 5000
+        max_delay_ms = max(base_delay_ms, min(15000, max_delay_ms))
+
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await self.client.retrieve_policy_snippets(
+                    segment_text=segment_text,
+                    speech_metadata=speech_metadata,
+                    top_k=top_k
+                )
+            except Exception as error:
+                last_error = error
+                is_transient = self._is_transient_policy_error(error)
+                if attempt >= max_retries or not is_transient:
+                    break
+
+                backoff_ms = min(max_delay_ms, base_delay_ms * (2 ** attempt))
+                jitter_ms = int(backoff_ms * 0.2 * ((attempt + 1) % 3))
+                wait_ms = backoff_ms + jitter_ms
+                print(
+                    f"  [{attempt_label}] retrieval transient error: {error} "
+                    f"(retry {attempt + 1}/{max_retries} in {wait_ms}ms)"
+                )
+                await asyncio.sleep(wait_ms / 1000.0)
+
+        raise last_error if last_error else Exception("Policy snippet retrieval failed")
+
     async def _retrieve_snippets_with_fallback(
         self,
         segment_text: str,
         speech_metadata: Dict[str, Any],
-        top_k: int
+        top_k: int,
+        attempt_label: str = "segment",
     ) -> Dict[str, Any]:
         """
         Retrieval fallback chain:
@@ -905,30 +964,33 @@ class PolicyChecker:
         2) shortened segment
         3) keyword query
         """
-        snippets = await self.client.retrieve_policy_snippets(
+        snippets = await self._retrieve_policy_snippets_with_retry(
             segment_text=segment_text,
             speech_metadata=speech_metadata,
-            top_k=top_k
+            top_k=top_k,
+            attempt_label=attempt_label,
         )
         if snippets:
             return {"snippets": snippets, "strategy": "full_segment"}
 
         shortened = segment_text[:320].strip()
         if shortened and shortened != segment_text:
-            snippets = await self.client.retrieve_policy_snippets(
+            snippets = await self._retrieve_policy_snippets_with_retry(
                 segment_text=shortened,
                 speech_metadata=speech_metadata,
-                top_k=top_k
+                top_k=top_k,
+                attempt_label=f"{attempt_label}/short",
             )
             if snippets:
                 return {"snippets": snippets, "strategy": "shortened_segment"}
 
         keywords = self._extract_retrieval_keywords(segment_text)
         if keywords:
-            snippets = await self.client.retrieve_policy_snippets(
+            snippets = await self._retrieve_policy_snippets_with_retry(
                 segment_text=keywords,
                 speech_metadata=speech_metadata,
-                top_k=top_k
+                top_k=top_k,
+                attempt_label=f"{attempt_label}/keywords",
             )
             if snippets:
                 return {"snippets": snippets, "strategy": "keyword_fallback", "query": keywords}
@@ -1015,7 +1077,13 @@ class PolicyChecker:
         print("\n" + "="*70)
         print("BSP POLICY ALIGNMENT CHECK (SYSTEMATIC RETRIEVAL MODE)")
         print("="*70)
-        print(f"\n🏛️ Retrieval mode: top_k={top_k}, max_segments={max_segments}")
+        try:
+            segment_parallelism = int(os.getenv("POLICY_SEGMENT_PARALLELISM", "3"))
+        except ValueError:
+            segment_parallelism = 3
+        segment_parallelism = max(1, min(8, segment_parallelism))
+
+        print(f"\n🏛️ Retrieval mode: top_k={top_k}, max_segments={max_segments}, parallelism={segment_parallelism}")
 
         segments = self._segment_speech(speech_content, max_segments=max_segments)
         print(f"  Segments to review: {len(segments)}")
@@ -1024,25 +1092,55 @@ class PolicyChecker:
         all_circulars = set()
         segment_traces: List[Dict[str, Any]] = []
         insufficient_evidence_segments: List[Dict[str, str]] = []
+        semaphore = asyncio.Semaphore(segment_parallelism)
 
-        for segment in segments:
+        async def _process_segment(index: int, segment: Dict[str, str]) -> Dict[str, Any]:
             segment_id = segment["segment_id"]
             segment_text = segment["text"]
 
-            retrieval_result = await self._retrieve_snippets_with_fallback(
-                segment_text=segment_text,
-                speech_metadata=speech_metadata,
-                top_k=top_k
-            )
-            snippets = retrieval_result.get("snippets", [])
-            retrieval_strategy = retrieval_result.get("strategy", "none")
+            try:
+                async with semaphore:
+                    retrieval_result = await self._retrieve_snippets_with_fallback(
+                        segment_text=segment_text,
+                        speech_metadata=speech_metadata,
+                        top_k=top_k,
+                        attempt_label=segment_id,
+                    )
+                snippets = retrieval_result.get("snippets", [])
+                retrieval_strategy = retrieval_result.get("strategy", "none")
+            except Exception as segment_error:
+                snippets = []
+                retrieval_strategy = "error"
+                print(f"  [{segment_id}] retrieval error: {segment_error}")
+
+            segment_violations = self._find_systematic_violations(segment_id, segment_text, snippets)
+
+            return {
+                "index": index,
+                "segment_id": segment_id,
+                "segment_text": segment_text,
+                "snippets": snippets,
+                "retrieval_strategy": retrieval_strategy,
+                "segment_violations": segment_violations,
+            }
+
+        segment_results = await asyncio.gather(
+            *[_process_segment(index, segment) for index, segment in enumerate(segments)]
+        )
+        segment_results.sort(key=lambda item: item["index"])
+
+        for result_item in segment_results:
+            segment_id = result_item["segment_id"]
+            segment_text = result_item["segment_text"]
+            snippets = result_item["snippets"]
+            retrieval_strategy = result_item["retrieval_strategy"]
+            segment_violations = result_item["segment_violations"]
 
             for snippet in snippets:
                 circ = snippet.get("circular_reference")
                 if circ:
                     all_circulars.add(circ)
 
-            segment_violations = self._find_systematic_violations(segment_id, segment_text, snippets)
             all_violations.extend(segment_violations)
 
             # IMPORTANT: retrieval miss is NOT a policy violation.

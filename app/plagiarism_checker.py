@@ -12,6 +12,7 @@ This module provides comprehensive plagiarism detection capabilities including:
 """
 
 import re
+import os
 import hashlib
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
@@ -134,7 +135,7 @@ class TextNormalizer:
             verbose: Print progress information
         """
         if not speech_id:
-            speech_id = hashlib.md5(text.encode()).hexdigest()[:8]
+            speech_id = hashlib.sha256(text.encode()).hexdigest()[:8]
         
         # Preprocess
         text = TextNormalizer.remove_headers_footers(text)
@@ -708,7 +709,7 @@ class PlagiarismChecker:
             # Create chunks from source
             chunks = TextNormalizer.create_chunks(
                 content,
-                speech_id=hashlib.md5(source['url'].encode()).hexdigest()[:8],
+                speech_id=hashlib.sha256(source['url'].encode()).hexdigest()[:8],
                 chunk_by="paragraph"
             )
             print(f"    Source {idx}: '{source['title'][:50]}...' → {len(chunks)} chunks")
@@ -1013,8 +1014,14 @@ Provide a brief 1-2 sentence explanation of the similarity and whether it appear
                 
                 try:
                     print(f"    Chunk {idx}: Generating explanation...", end="", flush=True)
+                    explanation_model = (
+                        os.getenv("AZURE_OPENAI_STAGE6_EXPLANATION_DEPLOYMENT")
+                        or os.getenv("AZURE_OPENAI_CHAT_MINI_DEPLOYMENT")
+                        or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+                        or "gpt-4o"
+                    )
                     response = await self.azure_client.chat.completions.create(
-                        model="gpt-4o",
+                        model=explanation_model,
                         messages=[
                             {"role": "system", "content": "You are an expert in plagiarism detection and academic integrity."},
                             {"role": "user", "content": prompt}

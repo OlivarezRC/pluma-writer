@@ -183,7 +183,7 @@ def deduplicate_evidence_store(
             # No valid key fields, skip
             continue
         
-        content_hash = hashlib.md5('|'.join(hash_parts).encode()).hexdigest()
+        content_hash = hashlib.sha256('|'.join(hash_parts).encode()).hexdigest()
         
         # Check if we've seen this content before
         if content_hash in seen_hashes:
@@ -212,7 +212,7 @@ def deduplicate_evidence_store(
         if 'dedup_info' not in evidence:
             evidence['dedup_info'] = {
                 'original_id': old_id,
-                'content_hash': hashlib.md5(str(evidence.get('claim', '')).encode()).hexdigest()[:12]
+                'content_hash': hashlib.sha256(str(evidence.get('claim', '')).encode()).hexdigest()[:12]
             }
     
     print(f"Evidence deduplication: {len(evidence_list)} → {len(deduplicated)} items (-{len(evidence_list) - len(deduplicated)} duplicates)")

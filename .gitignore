@@ -163,3 +163,8 @@ cython_debug/
 
 .deployment
 .vscode/
+
+# Security scan artifacts
+.secrets.baseline.local
+.secrets.baseline.ci
+zap_report.html

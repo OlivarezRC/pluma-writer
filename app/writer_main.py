@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import re
+import copy
 import requests
 import pandas as pd
 import streamlit as st
@@ -36,10 +37,352 @@ from app.plagiarism_checker import check_plagiarism
 from app.policy_checker import check_speech_policy_alignment
 
 
-# Model initialization for link processing - lazy loaded
-_link_processing_model = None
+# Model initialization for link processing - lazy loaded (tier/deployment aware)
+_link_processing_models: Dict[str, AzureAIChatCompletionsModel] = {}
 
-def _get_link_processing_model():
+# Optional persistent cache container (Cosmos)
+_stage1_cache_container = None
+
+# Stage 1 cache (in-memory per process)
+_STAGE1_CACHE: Dict[str, Dict[str, Any]] = {
+    "topic": {},
+    "links": {},
+    "attachments": {},
+}
+
+
+def _is_stage1_cache_enabled() -> bool:
+    return os.getenv("WRITER_STAGE1_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_stage1_persistent_cache_enabled() -> bool:
+    return os.getenv("WRITER_STAGE1_PERSISTENT_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_stage1_cache_container():
+    global _stage1_cache_container
+
+    if _stage1_cache_container is not None:
+        return _stage1_cache_container
+
+    if not _is_stage1_persistent_cache_enabled():
+        return None
+
+    try:
+        endpoint = os.getenv("AZURE_COSMOS_ENDPOINT")
+        key = os.getenv("AZURE_COSMOS_KEY")
+        database_name = os.getenv("AZURE_COSMOS_DATABASE")
+        container_name = os.getenv("WRITER_STAGE1_CACHE_CONTAINER", "writer_stage1_cache")
+        ttl_seconds = int(os.getenv("WRITER_STAGE1_CACHE_TTL_SECONDS", "86400"))
+
+        if not endpoint or not key or not database_name:
+            return None
+
+        cosmos_client = CosmosClient(url=endpoint, credential=key)
+        database = cosmos_client.get_database_client(database_name)
+        _stage1_cache_container = database.create_container_if_not_exists(
+            id=container_name,
+            partition_key=PartitionKey(path="/cache_bucket"),
+            default_ttl=max(60, ttl_seconds),
+        )
+        return _stage1_cache_container
+    except Exception:
+        return None
+
+
+def _stable_json_hash(payload: Any) -> str:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _parse_int_env(name: str, default_value: int, minimum: int = 1, maximum: int = 7) -> int:
+    raw = os.getenv(name, str(default_value))
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = default_value
+    return max(minimum, min(maximum, parsed))
+
+
+def _get_stage1_cache(bucket: str, cache_key: str) -> Optional[Dict[str, Any]]:
+    if not _is_stage1_cache_enabled():
+        return None
+
+    cache_bucket = _STAGE1_CACHE.get(bucket, {})
+    if cache_key not in cache_bucket:
+        # Optional persistent cache lookup
+        container = _get_stage1_cache_container()
+        if not container:
+            return None
+        try:
+            doc = container.read_item(item=cache_key, partition_key=bucket)
+            value = doc.get("value")
+            if isinstance(value, dict):
+                _STAGE1_CACHE.setdefault(bucket, {})[cache_key] = copy.deepcopy(value)
+                return copy.deepcopy(value)
+        except Exception:
+            return None
+        return None
+
+    return copy.deepcopy(cache_bucket[cache_key])
+
+
+def _set_stage1_cache(bucket: str, cache_key: str, value: Dict[str, Any]) -> None:
+    if not _is_stage1_cache_enabled():
+        return
+
+    if bucket not in _STAGE1_CACHE:
+        _STAGE1_CACHE[bucket] = {}
+    _STAGE1_CACHE[bucket][cache_key] = copy.deepcopy(value)
+
+    container = _get_stage1_cache_container()
+    if not container:
+        return
+
+    try:
+        max_doc_bytes = int(os.getenv("WRITER_STAGE1_CACHE_MAX_DOC_BYTES", "750000"))
+    except ValueError:
+        max_doc_bytes = 750000
+
+    try:
+        payload_json = json.dumps(value, ensure_ascii=False, default=str)
+        if len(payload_json.encode("utf-8")) > max_doc_bytes:
+            return
+
+        ttl_seconds = int(os.getenv("WRITER_STAGE1_CACHE_TTL_SECONDS", "86400"))
+        container.upsert_item({
+            "id": cache_key,
+            "cache_bucket": bucket,
+            "value": json.loads(payload_json),
+            "created_at": datetime.now().isoformat(),
+            "ttl": max(60, ttl_seconds),
+        })
+    except Exception:
+        return
+
+
+def _attachment_cache_fingerprint(attachment: Any) -> Dict[str, Any]:
+    if isinstance(attachment, dict):
+        content = attachment.get("content", "")
+        raw_bytes = attachment.get("bytes", b"")
+
+        if isinstance(content, str):
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        else:
+            content_hash = None
+
+        if isinstance(raw_bytes, (bytes, bytearray)):
+            bytes_hash = hashlib.sha256(bytes(raw_bytes)).hexdigest()
+        else:
+            bytes_hash = None
+
+        return {
+            "filename": attachment.get("filename"),
+            "file_type": attachment.get("file_type"),
+            "content_hash": content_hash,
+            "bytes_hash": bytes_hash,
+        }
+
+    if isinstance(attachment, str):
+        return {
+            "type": "str",
+            "content_hash": hashlib.sha256(attachment.encode("utf-8")).hexdigest(),
+        }
+
+    return {"type": type(attachment).__name__}
+
+
+def _reassign_evidence_ids(evidence_items: List[Dict[str, Any]], start_id: int) -> (List[Dict[str, Any]], int):
+    reassigned: List[Dict[str, Any]] = []
+    current_id = start_id
+
+    for item in evidence_items:
+        cloned = copy.deepcopy(item)
+        cloned["id"] = f"E{current_id}"
+        reassigned.append(cloned)
+        current_id += 1
+
+    return reassigned, current_id
+
+
+_STYLE_DIGEST_CACHE: Dict[str, Dict[str, str]] = {}
+_POLICY_CHECK_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _is_policy_cache_enabled() -> bool:
+    return os.getenv("WRITER_POLICY_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_policy_cache_ttl_seconds() -> int:
+    try:
+        ttl = int(os.getenv("WRITER_POLICY_CACHE_TTL_SECONDS", "7200"))
+    except ValueError:
+        ttl = 7200
+    return max(60, min(7 * 24 * 3600, ttl))
+
+
+def _build_policy_cache_key(speech_content: str, speech_metadata: Dict[str, Any]) -> str:
+    payload = {
+        "speech_hash": hashlib.sha256((speech_content or "").encode("utf-8")).hexdigest(),
+        "metadata": {
+            "topic": speech_metadata.get("topic"),
+            "speaker": speech_metadata.get("speaker"),
+            "audience": speech_metadata.get("audience"),
+            "query": speech_metadata.get("query"),
+        },
+        "policy_deployment": os.getenv("AZURE_POLICY_DEPLOYMENT"),
+        "policy_agent_id": os.getenv("AZURE_POLICY_AGENT_ID"),
+    }
+    return _stable_json_hash(payload)
+
+
+def _get_cached_policy_check(cache_key: str) -> Optional[Dict[str, Any]]:
+    if not _is_policy_cache_enabled():
+        return None
+
+    now_ts = time.time()
+    cached = _POLICY_CHECK_CACHE.get(cache_key)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return copy.deepcopy(cached.get("result"))
+
+    # Optional persistent reuse via shared cache container
+    cached_doc = _get_stage1_cache("policy", cache_key)
+    if cached_doc and isinstance(cached_doc, dict):
+        expires_at = float(cached_doc.get("expires_at", 0) or 0)
+        if expires_at > now_ts and isinstance(cached_doc.get("result"), dict):
+            _POLICY_CHECK_CACHE[cache_key] = copy.deepcopy(cached_doc)
+            return copy.deepcopy(cached_doc.get("result"))
+
+    return None
+
+
+def _set_cached_policy_check(cache_key: str, result: Dict[str, Any]) -> None:
+    if not _is_policy_cache_enabled() or not isinstance(result, dict):
+        return
+
+    expires_at = time.time() + _get_policy_cache_ttl_seconds()
+    payload = {
+        "result": copy.deepcopy(result),
+        "expires_at": expires_at,
+    }
+    _POLICY_CHECK_CACHE[cache_key] = payload
+    _set_stage1_cache("policy", cache_key, payload)
+
+
+def _severity_rank(level: str) -> int:
+    mapping = {
+        "critical": 4,
+        "high": 3,
+        "medium": 2,
+        "low": 1,
+    }
+    return mapping.get(str(level or "").strip().lower(), 0)
+
+
+def _policy_result_signature(policy_result: Dict[str, Any]) -> str:
+    violations = policy_result.get("violations", []) if isinstance(policy_result, dict) else []
+    compact_violations = []
+    for item in (violations or [])[:10]:
+        if not isinstance(item, dict):
+            continue
+        compact_violations.append({
+            "type": item.get("violation_type"),
+            "severity": str(item.get("severity", "")).lower(),
+            "text": (item.get("problematic_text", "") or "")[:180],
+        })
+
+    payload = {
+        "overall_compliance": policy_result.get("overall_compliance"),
+        "requires_revision": bool(policy_result.get("requires_revision")),
+        "score": round(float(policy_result.get("compliance_score") or 0), 4),
+        "violations": compact_violations,
+    }
+    return _stable_json_hash(payload)
+
+
+def _compact_text(value: Any, max_chars: int = 1200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            text = str(value)
+    else:
+        text = str(value)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " ..."
+
+
+def build_style_digest(style: Dict[str, Any]) -> Dict[str, str]:
+    style = style or {}
+    style_key = _stable_json_hash(style)
+    if style_key in _STYLE_DIGEST_CACHE:
+        return _STYLE_DIGEST_CACHE[style_key]
+
+    style_text_value = (
+        style.get("style_description")
+        or style.get("style")
+        or style.get("style_instructions")
+        or ((style.get("properties") or {}).get("style_instructions") if isinstance(style.get("properties"), dict) else "")
+    )
+    global_rules_value = style.get("global_rules") or style.get("global_rulebook") or style.get("rulebook")
+    guidelines_value = style.get("guidelines") or ""
+    example_value = style.get("example")
+    if not example_value:
+        evidence_spans = style.get("evidence_spans")
+        if isinstance(evidence_spans, list) and evidence_spans:
+            example_value = "\n".join(str(item) for item in evidence_spans if item)
+
+    digest = {
+        "style_text": _compact_text(style_text_value, max_chars=int(os.getenv("STYLE_DIGEST_STYLE_MAX", "2200"))),
+        "global_rules": _compact_text(global_rules_value, max_chars=int(os.getenv("STYLE_DIGEST_RULES_MAX", "1800"))),
+        "guidelines": _compact_text(guidelines_value, max_chars=int(os.getenv("STYLE_DIGEST_GUIDELINES_MAX", "1200"))),
+        "example": _compact_text(example_value, max_chars=int(os.getenv("STYLE_DIGEST_EXAMPLE_MAX", "900"))),
+    }
+
+    _STYLE_DIGEST_CACHE[style_key] = digest
+    return digest
+
+
+def prune_evidence_for_generation(query: str, evidence_store: List[Dict[str, Any]], max_items: int = 30) -> List[Dict[str, Any]]:
+    if not evidence_store:
+        return []
+
+    try:
+        env_max = int(os.getenv("STAGE3_MAX_EVIDENCE_ITEMS", str(max_items)))
+    except ValueError:
+        env_max = max_items
+    max_items = max(8, min(80, env_max))
+
+    query_tokens = set(re.findall(r"[a-zA-Z]{3,}", (query or "").lower()))
+
+    scored = []
+    for idx, evidence in enumerate(evidence_store):
+        claim = str(evidence.get("claim", ""))
+        quote = str(evidence.get("quote_span", ""))
+        combined = f"{claim} {quote}".lower()
+        evidence_tokens = set(re.findall(r"[a-zA-Z]{3,}", combined))
+
+        overlap = len(query_tokens & evidence_tokens) if query_tokens else 0
+        confidence = float(evidence.get("confidence", 0.0) or 0.0)
+        score = overlap * 3.0 + confidence
+        scored.append((score, idx, evidence))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    pruned = [item[2] for item in scored[:max_items]]
+
+    # Preserve original order for deterministic prompts
+    selected_ids = {id(item) for item in pruned}
+    ordered = [ev for ev in evidence_store if id(ev) in selected_ids]
+    return ordered
+
+def _get_link_processing_model(tier: str = "light"):
     """
     Lazy initialization of model for link processing.
     
@@ -49,21 +392,26 @@ def _get_link_processing_model():
     Raises:
         ValueError: If required environment variables are missing
     """
-    global _link_processing_model
-    
-    if _link_processing_model is not None:
-        return _link_processing_model
+    deployment_by_tier = {
+        "light": os.getenv("AZURE_INFERENCE_LIGHT_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
+        "strong": os.getenv("AZURE_INFERENCE_STRONG_DEPLOYMENT") or os.getenv("AZURE_DR_DEPLOYMENT"),
+    }
+
+    _model_name = deployment_by_tier.get(tier, deployment_by_tier["light"])
+    model_key = f"{tier}:{_model_name}"
+
+    if model_key in _link_processing_models:
+        return _link_processing_models[model_key]
     
     # Get environment variables
     _endpoint = os.getenv("AZURE_INFERENCE_ENDPOINT")
-    _model_name = os.getenv("AZURE_DEEPSEEK_DEPLOYMENT")
     _key = os.getenv("AZURE_AI_API_KEY")
     
     # Validate required environment variables
     if not _endpoint or not _model_name or not _key:
         missing = []
         if not _endpoint: missing.append("AZURE_INFERENCE_ENDPOINT")
-        if not _model_name: missing.append("AZURE_DEEPSEEK_DEPLOYMENT")
+        if not _model_name: missing.append("AZURE_DR_DEPLOYMENT")
         if not _key: missing.append("AZURE_AI_API_KEY")
         raise ValueError(
             f"Missing required environment variables for link processing: {', '.join(missing)}. "
@@ -71,13 +419,14 @@ def _get_link_processing_model():
         )
     
     # Initialize model
-    _link_processing_model = AzureAIChatCompletionsModel(
+    model_instance = AzureAIChatCompletionsModel(
         endpoint=_endpoint,
         credential=AzureKeyCredential(_key),
         model=_model_name,
     )
-    
-    return _link_processing_model
+
+    _link_processing_models[model_key] = model_instance
+    return model_instance
 
 
 async def generate_summary_from_evidence(query: str, evidence_store: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -101,9 +450,29 @@ async def generate_summary_from_evidence(query: str, evidence_store: List[Dict[s
     
     try:
         import re
+
+        token_usage_summary = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_calls": 0,
+        }
+
+        def _accumulate_usage(response_obj) -> None:
+            usage = getattr(response_obj, "usage", None)
+            if not usage:
+                return
+
+            token_usage_summary["api_calls"] += 1
+            token_usage_summary["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            token_usage_summary["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+
+            details = getattr(usage, "completion_tokens_details", None)
+            if details:
+                token_usage_summary["reasoning_tokens"] += int(getattr(details, "reasoning_tokens", 0) or 0)
         
         # Get LLM model
-        model = _get_link_processing_model()
+        model = _get_link_processing_model("light")
         
         # Build the evidence context with atomic claims
         evidence_context = ""
@@ -242,7 +611,7 @@ async def critique_summary(query: str, summary: str, evidence_store: List[Dict[s
     """
     try:
         # Get LLM model
-        model = _get_link_processing_model()
+        model = _get_link_processing_model("light")
         
         critique_prompt = f"""You are a research critic tasked with evaluating a research summary and identifying areas for improvement.
 
@@ -325,7 +694,7 @@ async def generate_adjustments_from_critique(query: str, critique: str) -> str:
         Adjusted query string with additional focus areas
     """
     try:
-        model = _get_link_processing_model()
+        model = _get_link_processing_model("light")
         
         adjustment_prompt = f"""Based on a critique of the current research, generate specific adjustments to refine the research focus.
 
@@ -392,6 +761,53 @@ def split_sources(sources: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _split_topic_for_parallel_processing(topic_text: str, max_parts: int = 3, min_parts: int = 1) -> List[str]:
+    """Split a broad topic string into deterministic shards for concurrent deep-research calls."""
+    text = (topic_text or "").strip()
+    if not text:
+        return []
+
+    # Try common separators first
+    raw_parts = re.split(r"\s*[;\n]\s*|\s*,\s*|\s+and\s+", text, flags=re.IGNORECASE)
+    parts = []
+    for part in raw_parts:
+        cleaned = (part or "").strip()
+        if len(cleaned) < 8:
+            continue
+        if cleaned.lower() == text.lower():
+            continue
+        parts.append(cleaned)
+
+    # Deduplicate while preserving order
+    unique_parts = list(dict.fromkeys(parts))
+    if not unique_parts:
+        unique_parts = [text]
+
+    # If we still have too few parts, do sentence/length-based sharding fallback
+    min_parts = max(1, min(max_parts, min_parts))
+    if len(unique_parts) < min_parts and len(text) >= 120:
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+        if len(sentences) >= min_parts:
+            buckets = [""] * min_parts
+            for idx, sentence in enumerate(sentences):
+                bucket_idx = idx % min_parts
+                buckets[bucket_idx] = (buckets[bucket_idx] + " " + sentence).strip()
+            unique_parts = [b for b in buckets if b]
+        else:
+            # Length-based fallback to guarantee at least min_parts chunks when practical
+            chunk_size = max(80, len(text) // min_parts)
+            chunks = []
+            cursor = 0
+            while cursor < len(text) and len(chunks) < min_parts:
+                chunks.append(text[cursor:cursor + chunk_size].strip())
+                cursor += chunk_size
+            chunks = [c for c in chunks if len(c) >= 40]
+            if len(chunks) >= min_parts:
+                unique_parts = chunks
+
+    return unique_parts[:max(1, max_parts)]
+
+
 async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -> Dict[str, Any]:
     """
     Process a topic by calling deep_research module.
@@ -412,6 +828,21 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
             "evidence_store": [],
             "next_evidence_id": evidence_id_start
         }
+
+    topic_cache_key = _stable_json_hash({
+        "query": query,
+        "topic": topic.strip(),
+        "deep_research_max_loops": os.getenv("DEEP_RESEARCH_MAX_LOOPS", "3"),
+    })
+    cached_topic_result = _get_stage1_cache("topic", topic_cache_key)
+    if cached_topic_result:
+        cached_evidence = cached_topic_result.get("evidence_store", [])
+        remapped_evidence, next_evidence_id = _reassign_evidence_ids(cached_evidence, evidence_id_start)
+        cached_topic_result["evidence_store"] = remapped_evidence
+        cached_topic_result["next_evidence_id"] = next_evidence_id
+        cached_topic_result["cache_hit"] = True
+        print(f"[CACHE] Topic processing cache hit ({len(remapped_evidence)} evidence items)")
+        return cached_topic_result
     
     try:
         from datetime import datetime
@@ -427,7 +858,7 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
         evidence_id = evidence_id_start
         
         # Use LLM to extract atomic claims
-        model = _get_link_processing_model()
+        model = _get_link_processing_model("light")
         
         extraction_prompt = f"""Extract atomic factual claims from this research summary with APA citation metadata. Each claim should be:
 - One clear factual statement
@@ -503,7 +934,7 @@ Return ONLY the JSON array, no other text."""
                     })
                     evidence_id += 1
         
-        return {
+        result_payload = {
             "success": True,
             "topic": topic,
             "query": query,
@@ -511,6 +942,9 @@ Return ONLY the JSON array, no other text."""
             "evidence_store": evidence_store,
             "next_evidence_id": evidence_id
         }
+
+        _set_stage1_cache("topic", topic_cache_key, result_payload)
+        return result_payload
     
     except Exception as e:
         return {
@@ -522,7 +956,12 @@ Return ONLY the JSON array, no other text."""
         }
 
 
-async def process_links(links: List[str], query: str, evidence_id_start: int = 1) -> Dict[str, Any]:
+async def process_links(
+    links: List[str],
+    query: str,
+    evidence_id_start: int = 1,
+    escalated_mode: bool = False,
+) -> Dict[str, Any]:
     """
     Process links to extract atomic claims with validated citations.
     
@@ -545,6 +984,20 @@ async def process_links(links: List[str], query: str, evidence_id_start: int = 1
             "evidence_store": [],
             "next_evidence_id": evidence_id_start
         }
+
+    links_cache_key = _stable_json_hash({
+        "query": query,
+        "links": links,
+    })
+    cached_links_result = _get_stage1_cache("links", links_cache_key)
+    if cached_links_result:
+        cached_evidence = cached_links_result.get("evidence_store", [])
+        remapped_evidence, next_evidence_id = _reassign_evidence_ids(cached_evidence, evidence_id_start)
+        cached_links_result["evidence_store"] = remapped_evidence
+        cached_links_result["next_evidence_id"] = next_evidence_id
+        cached_links_result["cache_hit"] = True
+        print(f"[CACHE] Link processing cache hit ({len(remapped_evidence)} evidence items)")
+        return cached_links_result
     
     processed_links = []
     evidence_store = []
@@ -569,7 +1022,7 @@ async def process_links(links: List[str], query: str, evidence_id_start: int = 1
         
         # Get LLM model
         try:
-            model = _get_link_processing_model()
+            model = _get_link_processing_model("light")
         except ValueError as e:
             return {
                 "type": "links",
@@ -581,39 +1034,90 @@ async def process_links(links: List[str], query: str, evidence_id_start: int = 1
                 "next_evidence_id": evidence_id_start
             }
         
-        # Process each link
-        for link in links:
+        link_parallelism = _parse_int_env("STAGE1_LINK_PARALLELISM", 3, minimum=1, maximum=8)
+        if escalated_mode:
+            min_escalated_parallelism = _parse_int_env(
+                "STAGE1_ESCALATED_MIN_LINK_PARALLELISM",
+                2,
+                minimum=1,
+                maximum=8,
+            )
+            link_parallelism = max(link_parallelism, min_escalated_parallelism)
+        tavily_max_retries = _parse_int_env("STAGE1_TAVILY_MAX_RETRIES", 2, minimum=0, maximum=5)
+        tavily_retry_base_ms = _parse_int_env("STAGE1_TAVILY_RETRY_BASE_MS", 450, minimum=100, maximum=5000)
+        tavily_retry_max_ms = _parse_int_env("STAGE1_TAVILY_RETRY_MAX_MS", 2500, minimum=250, maximum=10000)
+        print(f"[Stage 1] Link processing parallelism: {link_parallelism} (escalated={escalated_mode})")
+        semaphore = asyncio.Semaphore(link_parallelism)
+
+        async def _process_single_link(index: int, link: str) -> Dict[str, Any]:
             try:
-                # Use Tavily to extract content
-                search_result = await tavily_client.extract(urls=[link])
-                
-                if not search_result or not search_result.get("results") or len(search_result.get("results", [])) == 0:
-                    processed_links.append({
-                        "url": link,
-                        "status": "error",
-                        "error": "Could not extract content"
-                    })
-                    continue
-                
-                # Get extracted content
-                result = search_result["results"][0]
-                raw_content = result.get("raw_content", "")
-                title = result.get("title", "Unknown")
-                
-                if not raw_content or len(raw_content.strip()) == 0:
-                    processed_links.append({
-                        "url": link,
-                        "status": "error",
-                        "error": "Empty content"
-                    })
-                    continue
-                
-                # Truncate if too long
-                if len(raw_content) > 5000:
-                    raw_content = raw_content[:5000] + "..."
-                
-                # Extract atomic claims with exact quotes and APA metadata
-                extraction_prompt = f"""Extract atomic factual claims from this source that are relevant to the query.
+                async with semaphore:
+                    # Use Tavily to extract content (with lightweight retry/backoff for transient failures)
+                    search_result = None
+                    last_extract_error = None
+                    for attempt in range(tavily_max_retries + 1):
+                        try:
+                            search_result = await tavily_client.extract(urls=[link])
+                            last_extract_error = None
+                            break
+                        except Exception as extract_error:
+                            last_extract_error = extract_error
+                            if attempt >= tavily_max_retries:
+                                break
+
+                            error_text = str(extract_error).lower()
+                            transient_markers = [
+                                "429", "rate", "timeout", "tempor", "connection", "reset", "503", "502", "504"
+                            ]
+                            is_transient = any(marker in error_text for marker in transient_markers)
+                            if not is_transient:
+                                break
+
+                            backoff_ms = min(tavily_retry_max_ms, tavily_retry_base_ms * (2 ** attempt))
+                            jitter_ms = int(backoff_ms * 0.25 * ((index + attempt) % 4) / 3)
+                            wait_ms = backoff_ms + jitter_ms
+                            print(
+                                f"[Stage 1][Retry] Tavily extract transient error for {link} "
+                                f"(attempt {attempt + 1}/{tavily_max_retries + 1}); retrying in {wait_ms}ms"
+                            )
+                            await asyncio.sleep(wait_ms / 1000.0)
+
+                    if last_extract_error is not None:
+                        raise last_extract_error
+
+                    if not search_result or not search_result.get("results") or len(search_result.get("results", [])) == 0:
+                        return {
+                            "index": index,
+                            "processed_link": {
+                                "url": link,
+                                "status": "error",
+                                "error": "Could not extract content"
+                            },
+                            "claims": []
+                        }
+
+                    # Get extracted content
+                    result = search_result["results"][0]
+                    raw_content = result.get("raw_content", "")
+                    title = result.get("title", "Unknown")
+
+                    if not raw_content or len(raw_content.strip()) == 0:
+                        return {
+                            "index": index,
+                            "processed_link": {
+                                "url": link,
+                                "status": "error",
+                                "error": "Empty content"
+                            },
+                            "claims": []
+                        }
+
+                    # Truncate if too long
+                    if len(raw_content) > 5000:
+                        raw_content = raw_content[:5000] + "..."
+
+                    # Extract atomic claims with exact quotes and APA metadata
+                    extraction_prompt = f"""Extract atomic factual claims from this source that are relevant to the query.
 
 Query: {query}
 
@@ -633,29 +1137,39 @@ For each relevant fact, provide:
 - "publisher": publisher or organization name if identifiable
 
 Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
-                
-                messages = [
-                    SystemMessage(content="You are a precise fact extraction system. Extract atomic claims with exact verbatim quotes."),
-                    HumanMessage(content=extraction_prompt)
-                ]
-                
-                response = await model.ainvoke(messages)
-                response_content = response.content
-                
-                # Strip thinking tags
-                if "<think>" in response_content:
-                    response_content = response_content.split("</think>")[-1].strip()
-                
-                # Remove markdown code blocks
-                response_content = response_content.replace('```json', '').replace('```', '').strip()
-                
-                try:
-                    claims = json.loads(response_content)
-                    
-                    # Create evidence items with stable IDs and APA metadata
+
+                    messages = [
+                        SystemMessage(content="You are a precise fact extraction system. Extract atomic claims with exact verbatim quotes."),
+                        HumanMessage(content=extraction_prompt)
+                    ]
+
+                    response = await model.ainvoke(messages)
+                    response_content = response.content
+
+                    # Strip thinking tags
+                    if "<think>" in response_content:
+                        response_content = response_content.split("</think>")[-1].strip()
+
+                    # Remove markdown code blocks
+                    response_content = response_content.replace('```json', '').replace('```', '').strip()
+
+                    try:
+                        claims = json.loads(response_content)
+                    except json.JSONDecodeError as e:
+                        print(f"✗ Failed to parse claims from {link}: {e}")
+                        return {
+                            "index": index,
+                            "processed_link": {
+                                "url": link,
+                                "status": "error",
+                                "error": "Failed to parse claims"
+                            },
+                            "claims": []
+                        }
+
+                    extracted_claims: List[Dict[str, Any]] = []
                     for claim_data in claims:
-                        evidence_store.append({
-                            "id": f"E{evidence_id}",
+                        extracted_claims.append({
                             "claim": claim_data.get("claim", ""),
                             "source": link,
                             "source_url": link,
@@ -669,40 +1183,73 @@ Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
                             "confidence": claim_data.get("confidence", 0.85),
                             "timestamp_accessed": datetime.now().isoformat()
                         })
-                        evidence_id += 1
-                    
-                    processed_links.append({
-                        "url": link,
-                        "status": "success",
-                        "claims_extracted": len(claims),
-                        "title": title
-                    })
-                    
-                    print(f"✓ Extracted {len(claims)} atomic claims from {link}")
-                    
-                except json.JSONDecodeError as e:
-                    print(f"✗ Failed to parse claims from {link}: {e}")
-                    processed_links.append({
-                        "url": link,
-                        "status": "error",
-                        "error": "Failed to parse claims"
-                    })
-                    
+
+                    print(f"✓ Extracted {len(extracted_claims)} atomic claims from {link}")
+                    return {
+                        "index": index,
+                        "processed_link": {
+                            "url": link,
+                            "status": "success",
+                            "claims_extracted": len(extracted_claims),
+                            "title": title
+                        },
+                        "claims": extracted_claims
+                    }
+
             except Exception as e:
                 error_msg = str(e)
                 print(f"✗ Error processing {link}: {error_msg}")
-                processed_links.append({
-                    "url": link,
-                    "status": "error",
-                    "error": f"Could not extract content: {error_msg}"
+                return {
+                    "index": index,
+                    "processed_link": {
+                        "url": link,
+                        "status": "error",
+                        "error": f"Could not extract content: {error_msg}"
+                    },
+                    "claims": []
+                }
+
+        link_results = await asyncio.gather(
+            *[_process_single_link(index, link) for index, link in enumerate(links)],
+            return_exceptions=True
+        )
+
+        ordered_results: List[Dict[str, Any]] = []
+        for index, task_result in enumerate(link_results):
+            if isinstance(task_result, Exception):
+                ordered_results.append({
+                    "index": index,
+                    "processed_link": {
+                        "url": links[index],
+                        "status": "error",
+                        "error": f"Task failed: {task_result}"
+                    },
+                    "claims": []
                 })
+            else:
+                ordered_results.append(task_result)
+
+        ordered_results.sort(key=lambda item: item.get("index", 0))
+
+        for item in ordered_results:
+            processed_links.append(item.get("processed_link", {
+                "url": "unknown",
+                "status": "error",
+                "error": "Unknown processing failure"
+            }))
+
+            for claim in item.get("claims", []):
+                claim_with_id = dict(claim)
+                claim_with_id["id"] = f"E{evidence_id}"
+                evidence_store.append(claim_with_id)
+                evidence_id += 1
     
     finally:
         # Close Tavily client
         if tavily_client:
             await tavily_client.close()
     
-    return {
+    result_payload = {
         "type": "links",
         "count": len(links),
         "items": processed_links,
@@ -710,6 +1257,9 @@ Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
         "evidence_store": evidence_store,
         "next_evidence_id": evidence_id
     }
+
+    _set_stage1_cache("links", links_cache_key, result_payload)
+    return result_payload
 
 
 async def process_attachments(attachments: List[Any], query: str, evidence_id_start: int = 1) -> Dict[str, Any]:
@@ -734,6 +1284,20 @@ async def process_attachments(attachments: List[Any], query: str, evidence_id_st
             "evidence_store": [],
             "next_evidence_id": evidence_id_start,
         }
+
+    attachments_cache_key = _stable_json_hash({
+        "query": query,
+        "attachments": [_attachment_cache_fingerprint(item) for item in attachments],
+    })
+    cached_attachments_result = _get_stage1_cache("attachments", attachments_cache_key)
+    if cached_attachments_result:
+        cached_evidence = cached_attachments_result.get("evidence_store", [])
+        remapped_evidence, next_evidence_id = _reassign_evidence_ids(cached_evidence, evidence_id_start)
+        cached_attachments_result["evidence_store"] = remapped_evidence
+        cached_attachments_result["next_evidence_id"] = next_evidence_id
+        cached_attachments_result["cache_hit"] = True
+        print(f"[CACHE] Attachment processing cache hit ({len(remapped_evidence)} evidence items)")
+        return cached_attachments_result
 
     async def extract_docint_text(raw_bytes: bytes) -> str:
         endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "").rstrip("/")
@@ -804,7 +1368,7 @@ async def process_attachments(attachments: List[Any], query: str, evidence_id_st
             return metadata
 
         try:
-            model = _get_link_processing_model()
+            model = _get_link_processing_model("light")
             prompt = f"""Extract bibliographic metadata from this document text and filename.
 
 Filename: {filename}
@@ -845,7 +1409,7 @@ Rules:
         if not text:
             return []
         try:
-            model = _get_link_processing_model()
+            model = _get_link_processing_model("light")
             prompt = f"""Extract atomic factual claims from this attachment relevant to the query.
 
 Query: {query_text}
@@ -943,7 +1507,7 @@ Extract 3-8 claims if possible.
 
         print(f"✓ Extracted {len(claims)} atomic claims from attachment: {filename}")
 
-    return {
+    result_payload = {
         "type": "attachments",
         "count": len(processed_items),
         "items": processed_items,
@@ -952,8 +1516,16 @@ Extract 3-8 claims if possible.
         "next_evidence_id": evidence_id,
     }
 
+    _set_stage1_cache("attachments", attachments_cache_key, result_payload)
+    return result_payload
 
-async def process_user_input(query: str, sources: Dict[str, Any], evidence_id_start: int = 1) -> Dict[str, Any]:
+
+async def process_user_input(
+    query: str,
+    sources: Dict[str, Any],
+    evidence_id_start: int = 1,
+    escalated_mode: bool = False,
+) -> Dict[str, Any]:
     """
     Main function to process user query and sources with atomic evidence tracking.
     
@@ -983,50 +1555,121 @@ async def process_user_input(query: str, sources: Dict[str, Any], evidence_id_st
         "next_evidence_id": evidence_id_start
     }
     
-    # Track evidence ID continuity across all sources
-    next_evidence_id = evidence_id_start
-    
-    # Process topics through deep_research
+    print(f"\n[Stage 1] Processing topic, links, and attachments in parallel... (escalated={escalated_mode})")
+    source_tasks: List[Any] = []
+    source_keys: List[str] = []
+
     if split_data["topics"]:
-        print(f"\n[Evidence IDs starting at E{next_evidence_id}]")
-        results["topic_results"] = await topic_processing(
-            split_data["topics"],
-            query,
-            evidence_id_start=next_evidence_id
-        )
-        # Add topic evidence to combined evidence store
-        if results["topic_results"] and results["topic_results"].get("evidence_store"):
-            results["evidence_store"].extend(results["topic_results"]["evidence_store"])
-            next_evidence_id = results["topic_results"].get("next_evidence_id", next_evidence_id)
-            print(f"[Topic processing: added {len(results['topic_results']['evidence_store'])} evidence items]")
-    
-    # Process links
+        topic_tasks: List[Any] = []
+        topic_shards = [split_data["topics"]]
+        if escalated_mode and os.getenv("STAGE1_ESCALATED_TOPIC_SHARDING", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            max_topic_shards = _parse_int_env("STAGE1_ESCALATED_TOPIC_SHARDS", 3, minimum=1, maximum=5)
+            min_topic_shards = _parse_int_env("STAGE1_ESCALATED_MIN_TOPIC_SHARDS", 2, minimum=1, maximum=5)
+            topic_shards = _split_topic_for_parallel_processing(
+                split_data["topics"],
+                max_parts=max_topic_shards,
+                min_parts=min_topic_shards,
+            )
+            print(f"[Stage 1] Escalated topic sharding: {len(topic_shards)} shard(s)")
+
+        if len(topic_shards) <= 1:
+            source_keys.append("topic_results")
+            source_tasks.append(topic_processing(split_data["topics"], query, evidence_id_start=1))
+        else:
+            source_keys.append("topic_results")
+
+            async def _process_topic_shards() -> Dict[str, Any]:
+                async def _run_topic_shard(shard: str) -> Dict[str, Any]:
+                    print(f"[Stage 1][TopicShard] START: {shard[:80]}{'...' if len(shard) > 80 else ''}")
+                    shard_result = await topic_processing(shard, query, evidence_id_start=1)
+                    status = "ok" if shard_result.get("success") else "failed"
+                    print(f"[Stage 1][TopicShard] END ({status}): {shard[:80]}{'...' if len(shard) > 80 else ''}")
+                    return shard_result
+
+                shard_results = await asyncio.gather(
+                    *[_run_topic_shard(shard) for shard in topic_shards],
+                    return_exceptions=True,
+                )
+
+                combined_evidence: List[Dict[str, Any]] = []
+                combined_summaries: List[str] = []
+                failed_shards = 0
+
+                for shard, shard_result in zip(topic_shards, shard_results):
+                    if isinstance(shard_result, Exception):
+                        failed_shards += 1
+                        print(f"✗ topic shard failed: {shard} -> {shard_result}")
+                        continue
+                    if not shard_result.get("success"):
+                        failed_shards += 1
+                        print(f"✗ topic shard unsuccessful: {shard} -> {shard_result.get('error', 'unknown')}")
+                        continue
+
+                    combined_evidence.extend(shard_result.get("evidence_store", []))
+                    shard_summary = (shard_result.get("summary") or "").strip()
+                    if shard_summary:
+                        combined_summaries.append(f"### {shard}\n{shard_summary}")
+
+                return {
+                    "success": len(combined_evidence) > 0,
+                    "topic": split_data["topics"],
+                    "query": query,
+                    "summary": "\n\n".join(combined_summaries),
+                    "evidence_store": combined_evidence,
+                    "next_evidence_id": 1,
+                    "topic_shards": topic_shards,
+                    "failed_topic_shards": failed_shards,
+                }
+
+            source_tasks.append(_process_topic_shards())
+
     if split_data["links"]:
-        print(f"\n[Evidence IDs starting at E{next_evidence_id}]")
-        results["link_results"] = await process_links(
-            split_data["links"],
-            query,
-            evidence_id_start=next_evidence_id
+        source_keys.append("link_results")
+        source_tasks.append(
+            process_links(
+                split_data["links"],
+                query,
+                evidence_id_start=1,
+                escalated_mode=escalated_mode,
+            )
         )
-        # Add link evidence to combined evidence store
-        if results["link_results"] and results["link_results"].get("evidence_store"):
-            results["evidence_store"].extend(results["link_results"]["evidence_store"])
-            next_evidence_id = results["link_results"].get("next_evidence_id", next_evidence_id)
-            print(f"[Link processing: added {len(results['link_results']['evidence_store'])} evidence items]")
-    
-    # Process attachments
+
     if split_data["attachments"]:
-        print(f"\n[Evidence IDs starting at E{next_evidence_id}]")
-        results["attachment_results"] = await process_attachments(
-            split_data["attachments"],
-            query,
-            evidence_id_start=next_evidence_id
+        source_keys.append("attachment_results")
+        source_tasks.append(process_attachments(split_data["attachments"], query, evidence_id_start=1))
+
+    if source_tasks:
+        print(f"[Stage 1] Launching {len(source_tasks)} source task(s) concurrently")
+        parallel_results = await asyncio.gather(*source_tasks, return_exceptions=True)
+        for key, task_result in zip(source_keys, parallel_results):
+            if isinstance(task_result, Exception):
+                results[key] = {
+                    "success": False,
+                    "error": str(task_result),
+                    "evidence_store": [],
+                    "next_evidence_id": 1,
+                }
+                print(f"✗ {key} failed: {task_result}")
+            else:
+                results[key] = task_result
+
+    # Deterministic evidence ID assignment order: topic -> links -> attachments
+    next_evidence_id = evidence_id_start
+    for key in ["topic_results", "link_results", "attachment_results"]:
+        source_result = results.get(key)
+        if not source_result or not source_result.get("evidence_store"):
+            continue
+
+        remapped_evidence, next_evidence_id = _reassign_evidence_ids(
+            source_result.get("evidence_store", []),
+            next_evidence_id,
         )
-        # Add attachment evidence to combined evidence store (future implementation)
-        if results["attachment_results"] and results["attachment_results"].get("evidence_store"):
-            results["evidence_store"].extend(results["attachment_results"]["evidence_store"])
-            next_evidence_id = results["attachment_results"].get("next_evidence_id", next_evidence_id)
-            print(f"[Attachment processing: added {len(results['attachment_results']['evidence_store'])} evidence items]")
+        source_result["evidence_store"] = remapped_evidence
+        source_result["next_evidence_id"] = next_evidence_id
+        results["evidence_store"].extend(remapped_evidence)
+
+        label = key.replace("_results", "").replace("_", " ").title()
+        print(f"[{label} processing: added {len(remapped_evidence)} evidence items]")
     
     # Print evidence ID summary
     if results["evidence_store"]:
@@ -1055,6 +1698,7 @@ async def process_with_iterative_refinement(
     sources: Dict[str, Any],
     max_iterations: int = 3,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    iteration_prefix: str = "",
 ) -> Dict[str, Any]:
     """
     Process user query with iterative refinement - runs multiple iterations with critiques and adjustments.
@@ -1078,22 +1722,73 @@ async def process_with_iterative_refinement(
     current_query = query
     cumulative_evidence = []
     next_evidence_id = 1  # Track evidence ID across all iterations
+    is_escalated_run = iteration_prefix.strip().upper().startswith("ESCALATED")
+
+    try:
+        min_gain_ratio = float(os.getenv("ITERATIVE_EARLY_STOP_MIN_GAIN_RATIO", "0.10"))
+    except ValueError:
+        min_gain_ratio = 0.10
+    min_gain_ratio = max(0.0, min(1.0, min_gain_ratio))
+
+    try:
+        consecutive_rounds_required = int(os.getenv("ITERATIVE_EARLY_STOP_CONSECUTIVE_ROUNDS", "2"))
+    except ValueError:
+        consecutive_rounds_required = 2
+    consecutive_rounds_required = max(1, min(5, consecutive_rounds_required))
+
+    if is_escalated_run:
+        try:
+            min_gain_ratio = float(os.getenv("ESCALATED_ITERATIVE_EARLY_STOP_MIN_GAIN_RATIO", str(min_gain_ratio)))
+        except ValueError:
+            pass
+        min_gain_ratio = max(0.0, min(1.0, min_gain_ratio))
+
+        try:
+            consecutive_rounds_required = int(
+                os.getenv("ESCALATED_ITERATIVE_EARLY_STOP_CONSECUTIVE_ROUNDS", "1")
+            )
+        except ValueError:
+            consecutive_rounds_required = 1
+        consecutive_rounds_required = max(1, min(5, consecutive_rounds_required))
+
+        print(
+            "[ESCALATED] Early-stop config: "
+            f"min_gain_ratio={min_gain_ratio:.2f}, consecutive_rounds={consecutive_rounds_required}"
+        )
+
+    early_stop_enabled = os.getenv("ITERATIVE_EARLY_STOP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    low_gain_streak = 0
     
     for iteration in range(1, max_iterations + 1):
-        emit("stage_text", stage=1, text=f"Iteration {iteration}/{max_iterations}")
+        iteration_label = f"{iteration_prefix}Iteration {iteration}/{max_iterations}".strip()
+        emit("stage_text", stage=1, text=iteration_label)
         print(f"\n{'='*70}")
-        print(f"ITERATION {iteration}/{max_iterations}")
+        print(f"{(iteration_prefix + 'ITERATION').strip()} {iteration}/{max_iterations}")
         print(f"{'='*70}")
         
         # Process the current iteration with continuing evidence IDs
-        iteration_results = await process_user_input(current_query, sources, evidence_id_start=next_evidence_id)
+        iteration_results = await process_user_input(
+            current_query,
+            sources,
+            evidence_id_start=next_evidence_id,
+            escalated_mode=is_escalated_run,
+        )
         
         # Update next_evidence_id for the next iteration
         next_evidence_id = iteration_results.get("next_evidence_id", next_evidence_id)
         
+        previous_cumulative_count = len(cumulative_evidence)
+
         # Add new evidence to cumulative store
         new_evidence = iteration_results.get("evidence_store", [])
         cumulative_evidence.extend(new_evidence)
+
+        gain_ratio = 1.0
+        if previous_cumulative_count > 0:
+            gain_ratio = len(new_evidence) / previous_cumulative_count
+
+        emit("stage_metric", stage=1, key="New Evidence", value=len(new_evidence))
+        emit("stage_metric", stage=1, key="Evidence Gain", value=f"{gain_ratio * 100:.1f}%")
         
         # Update iteration results with cumulative evidence
         iteration_results["cumulative_evidence_store"] = cumulative_evidence.copy()
@@ -1119,6 +1814,32 @@ async def process_with_iterative_refinement(
             key="Cumulative Evidence",
             value=len(cumulative_evidence),
         )
+
+        if early_stop_enabled and iteration > 1:
+            if gain_ratio < min_gain_ratio:
+                low_gain_streak += 1
+                print(
+                    f"[Iteration {iteration}] Low evidence gain detected: "
+                    f"{gain_ratio * 100:.1f}% (< {min_gain_ratio * 100:.1f}%) "
+                    f"[{low_gain_streak}/{consecutive_rounds_required}]"
+                )
+            else:
+                low_gain_streak = 0
+
+            if low_gain_streak >= consecutive_rounds_required and iteration < max_iterations:
+                print(f"[Iteration {iteration}] Early-stop triggered due to consistently low evidence gain")
+                emit(
+                    "stage_text",
+                    stage=1,
+                    text=(
+                        f"Early-stop triggered at iteration {iteration}: "
+                        f"evidence gain stayed below {min_gain_ratio * 100:.1f}%"
+                    ),
+                )
+                iteration_data["early_stop_triggered"] = True
+                iteration_data["evidence_gain_ratio"] = gain_ratio
+                iterations.append(iteration_data)
+                break
         
         # Only critique if not the last iteration
         if iteration < max_iterations:
@@ -1136,12 +1857,20 @@ async def process_with_iterative_refinement(
                 
                 if critique_result.get("success"):
                     print(f"[Iteration {iteration}] Generating adjustments for next iteration...")
-                    
-                    # Generate adjustments for next iteration
-                    adjusted_query = await generate_adjustments_from_critique(
-                        query,
-                        critique_result["critique"]
+
+                    freeze_query_adjustment = (
+                        is_escalated_run and
+                        os.getenv("ESCALATED_DISABLE_QUERY_ADJUSTMENT", "true").strip().lower() in {"1", "true", "yes", "on"}
                     )
+                    if freeze_query_adjustment:
+                        print(f"[Iteration {iteration}] Escalated mode: query adjustment disabled for cache reuse")
+                        adjusted_query = current_query
+                    else:
+                        # Generate adjustments for next iteration
+                        adjusted_query = await generate_adjustments_from_critique(
+                            query,
+                            critique_result["critique"]
+                        )
                     
                     iteration_data["adjustments"] = {
                         "original_query": query,
@@ -1164,11 +1893,14 @@ async def process_with_iterative_refinement(
         
         iterations.append(iteration_data)
     
+    total_iterations_run = len(iterations)
+
     # Build final results
     final_results = {
         "original_query": query,
         "sources": sources,
-        "total_iterations": max_iterations,
+        "total_iterations": total_iterations_run,
+        "max_iterations_requested": max_iterations,
         "iterations": iterations,
         "final_summary": iterations[-1]["results"].get("generated_summary", {}),
         "final_evidence_count": len(cumulative_evidence),
@@ -1619,7 +2351,11 @@ async def smart_trim_speech_to_max_length(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
 
-        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = (
+            os.getenv("AZURE_OPENAI_STAGE3_EDIT_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        )
 
         style_context = ""
         if style_profile:
@@ -1746,7 +2482,11 @@ async def fix_speech_issues(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
         
-        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = (
+            os.getenv("AZURE_OPENAI_STAGE3_EDIT_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_STRONG_DEPLOYMENT")
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        )
         
         # Build issue-specific system prompt
         system_prompts = {
@@ -1903,6 +2643,26 @@ async def generate_styled_output(
     
     try:
         import re
+
+        token_usage_summary = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_calls": 0,
+        }
+
+        def _accumulate_usage(response_obj) -> None:
+            usage = getattr(response_obj, "usage", None)
+            if not usage:
+                return
+
+            token_usage_summary["api_calls"] += 1
+            token_usage_summary["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            token_usage_summary["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+
+            details = getattr(usage, "completion_tokens_details", None)
+            if details:
+                token_usage_summary["reasoning_tokens"] += int(getattr(details, "reasoning_tokens", 0) or 0)
         
         # Initialize Azure OpenAI client (GPT-5 or configured model)
         client = AzureOpenAI(
@@ -1911,43 +2671,14 @@ async def generate_styled_output(
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
         
-        model = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+        model = os.getenv("AZURE_OPENAI_STAGE3_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
         
-        # Extract style components (matching existing app structure)
-        def normalize_prompt_text(value: Any) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, str):
-                return value
-            if isinstance(value, (dict, list)):
-                try:
-                    return json.dumps(value, ensure_ascii=False, indent=2)
-                except Exception:
-                    return str(value)
-            return str(value)
-
-        style_text_value = (
-            style.get("style_description")
-            or style.get("style")
-            or style.get("style_instructions")
-            or ((style.get("properties") or {}).get("style_instructions") if isinstance(style.get("properties"), dict) else "")
-        )
-        global_rules_value = (
-            style.get("global_rules")
-            or style.get("global_rulebook")
-            or style.get("rulebook")
-        )
-        guidelines_value = style.get("guidelines") or ""
-        example_value = style.get("example")
-        if not example_value:
-            evidence_spans = style.get("evidence_spans")
-            if isinstance(evidence_spans, list) and evidence_spans:
-                example_value = "\n".join(str(item) for item in evidence_spans if item)
-
-        style_text = normalize_prompt_text(style_text_value)
-        global_rules = normalize_prompt_text(global_rules_value)
-        guidelines = normalize_prompt_text(guidelines_value)
-        example = normalize_prompt_text(example_value)
+        # Extract compact style digest (cached) to reduce prompt size/cost
+        style_digest = build_style_digest(style)
+        style_text = style_digest.get("style_text", "")
+        global_rules = style_digest.get("global_rules", "")
+        guidelines = style_digest.get("guidelines", "")
+        example = style_digest.get("example", "")
         
         # Build allowed evidence IDs list
         allowed_ids = []
@@ -2011,6 +2742,7 @@ JSON:"""
                     ],
                     max_completion_tokens=8000  # GPT-5 uses lots of reasoning tokens, needs higher limit (default temp=1 only)
                 )
+                _accumulate_usage(response)
                 
                 # Check finish reason first
                 finish_reason = response.choices[0].finish_reason
@@ -2143,7 +2875,13 @@ JSON:"""
         speaker_name = style.get("speaker") or style.get("Speaker")
         if speaker_name:
             print(f"[INFO] Fetching sample speeches for speaker: {speaker_name}")
-            sample_speeches = get_sample_speeches_from_db(speaker_name, max_speeches=3)
+            try:
+                max_speeches = int(os.getenv("STAGE3_MAX_SPEECH_EXAMPLES", "1"))
+            except ValueError:
+                max_speeches = 1
+            max_speeches = max(0, min(3, max_speeches))
+
+            sample_speeches = get_sample_speeches_from_db(speaker_name, max_speeches=max_speeches)
             
             if sample_speeches:
                 system_parts.append("\n<realSpeechExamples>\n")
@@ -2154,12 +2892,18 @@ JSON:"""
                 system_parts.append("- Transition phrases\n")
                 system_parts.append("- Rhetorical devices\n\n")
                 
+                try:
+                    excerpt_chars = int(os.getenv("STAGE3_SPEECH_EXCERPT_CHARS", "900"))
+                except ValueError:
+                    excerpt_chars = 900
+                excerpt_chars = max(300, min(2000, excerpt_chars))
+
                 for i, speech in enumerate(sample_speeches, 1):
-                    # Truncate very long speeches to fit in context
-                    speech_excerpt = speech[:2000] if len(speech) > 2000 else speech
+                    # Truncate speeches to fit compact prompt budget
+                    speech_excerpt = speech[:excerpt_chars] if len(speech) > excerpt_chars else speech
                     system_parts.append(f"=== SPEECH EXAMPLE {i} ===\n")
                     system_parts.append(f"{speech_excerpt}\n")
-                    if len(speech) > 2000:
+                    if len(speech) > excerpt_chars:
                         system_parts.append("... (excerpt from longer speech)\n")
                     system_parts.append("\n")
                 
@@ -2260,6 +3004,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 ],
                 max_completion_tokens=completion_token_budget
             )
+            _accumulate_usage(response)
             print(f"[DEBUG] API call successful, response choices: {len(response.choices)}")
         except Exception as api_error:
             print(f"[DEBUG] API call failed: {str(api_error)}")
@@ -2270,7 +3015,8 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "style_name": style.get("name", "Unknown"),
                 "speaker": style.get("speaker", "Unknown"),
                 "audience": style.get("audience_setting_classification", "General"),
-                "model_used": model
+                "model_used": model,
+                "token_usage": token_usage_summary,
             }
         
         # Extract and truncate styled output (matching existing app behavior)
@@ -2314,7 +3060,8 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "style_name": style.get("name", "Unknown"),
                 "speaker": style.get("speaker", "Unknown"),
                 "audience": style.get("audience_setting_classification", "General"),
-                "model_used": model
+                "model_used": model,
+                "token_usage": token_usage_summary,
             }
         
         # If over max length, prioritize smart LLM trimming before hard truncation.
@@ -2378,6 +3125,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             "speaker": style.get("speaker", "Unknown"),
             "audience": style.get("audience_setting_classification", "General"),
             "model_used": model,
+            "token_usage": token_usage_summary,
             "output_length": len(strip_in_text_citations(output_body)) if output_body else 0,
             "output_length_raw": len(output_body) if output_body else 0,
             "references_length": len(output_refs) if output_refs else 0,
@@ -2410,7 +3158,13 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             "error": str(e),
             "styled_output": summary,  # Fallback to unstyled summary
             "claim_outline_used": False,
-            "claim_count": 0
+            "claim_count": 0,
+            "token_usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "api_calls": 0,
+            },
         }
 
 
@@ -2812,91 +3566,190 @@ async def verify_styled_citations(
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
             api_key=os.getenv("AZURE_OPENAI_KEY"),
         )
-    
-    # Use gpt-4o for verification (more reliable than gpt-5 for this task)
-    model = "gpt-4o"  # Hardcoded for reliability
-    
-    # Verify each segment with LLM
-    verified_count = 0
-    unverified_count = 0
-    
-    print(f"\nVerifying segments using {model}...")
-    
-    for i, segment in enumerate(segments, 1):
-        # Skip if missing evidence
+
+    verification_model = (
+        os.getenv("AZURE_OPENAI_STAGE4_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_VERIFICATION_DEPLOYMENT")
+        or os.getenv("AZURE_OPENAI_CHAT_MINI_DEPLOYMENT")
+        or "gpt-4o-mini"
+    )
+    use_llm_for_uncertain = os.getenv("WRITER_VERIFY_USE_LLM", "true").strip().lower() in {"1", "true", "yes", "on"}
+    token_usage_summary = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "api_calls": 0,
+    }
+
+    try:
+        batch_size = int(os.getenv("WRITER_VERIFY_BATCH_SIZE", "12"))
+    except ValueError:
+        batch_size = 12
+    batch_size = max(8, min(20, batch_size))
+
+    try:
+        lexical_overlap_threshold = float(os.getenv("WRITER_VERIFY_LEXICAL_OVERLAP_THRESHOLD", "0.18"))
+    except ValueError:
+        lexical_overlap_threshold = 0.18
+
+    try:
+        lexical_low_threshold = float(os.getenv("WRITER_VERIFY_LEXICAL_LOW_THRESHOLD", "0.06"))
+    except ValueError:
+        lexical_low_threshold = 0.06
+
+    def _tokenize(text: str) -> set:
+        return set(re.findall(r"[a-zA-Z]{3,}", (text or "").lower()))
+
+    def _extract_numbers(text: str) -> set:
+        return set(re.findall(r"\b\d+(?:\.\d+)?%?\b", text or ""))
+
+    def _rule_precheck(segment: Dict[str, Any]) -> Dict[str, str]:
+        claims_blob = " ".join(
+            f"{c.get('claim', '')} {c.get('quote_span', '')}" for c in segment.get("cited_claims", [])
+        )
+        seg_tokens = _tokenize(segment.get("text", ""))
+        claim_tokens = _tokenize(claims_blob)
+        overlap = len(seg_tokens & claim_tokens) / max(1, len(seg_tokens))
+
+        seg_numbers = _extract_numbers(segment.get("text", ""))
+        evidence_numbers = _extract_numbers(claims_blob)
+
+        if seg_numbers and evidence_numbers and seg_numbers.isdisjoint(evidence_numbers):
+            return {
+                "status": "No",
+                "reason": "Numeric mismatch with cited evidence (rule precheck)",
+            }
+
+        if overlap >= lexical_overlap_threshold:
+            return {
+                "status": "Yes",
+                "reason": f"Rule precheck passed (lexical overlap {overlap:.2f})",
+            }
+
+        if overlap < lexical_low_threshold and seg_numbers and not evidence_numbers:
+            return {
+                "status": "No",
+                "reason": "Segment includes numeric claim not present in cited evidence (rule precheck)",
+            }
+
+        return {
+            "status": "Uncertain",
+            "reason": f"Rule precheck uncertain (lexical overlap {overlap:.2f})",
+        }
+
+    def _clean_json_text(text: str) -> str:
+        cleaned = (text or "").replace("```json", "").replace("```", "").strip()
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            return cleaned[start:end + 1]
+        return cleaned
+
+    def _apply_llm_batch_results(batch_items: List[Dict[str, Any]], parsed_results: List[Dict[str, Any]]) -> None:
+        result_map = {}
+        for item in parsed_results:
+            seg_no = item.get("segment_number")
+            if isinstance(seg_no, int):
+                result_map[seg_no] = item
+
+        for item in batch_items:
+            segment = item["segment"]
+            seg_no = segment.get("segment_number")
+            llm_item = result_map.get(seg_no)
+            if not llm_item:
+                segment["verified"] = "Error"
+                segment["verification_reason"] = "Batch verification missing response"
+                continue
+
+            verdict = str(llm_item.get("verdict", "")).strip().upper()
+            reason = str(llm_item.get("reason", "")).strip() or "LLM verification result"
+            if verdict == "VERIFIED":
+                segment["verified"] = "Yes"
+                segment["verification_reason"] = reason
+            else:
+                segment["verified"] = "No"
+                segment["verification_reason"] = reason
+
+    uncertain_segments: List[Dict[str, Any]] = []
+    prechecked_yes = 0
+    prechecked_no = 0
+
+    for segment in segments:
         if segment["missing_evidence_ids"]:
             segment["verified"] = "No"
             segment["verification_reason"] = f"Missing evidence IDs: {', '.join(segment['missing_evidence_ids'])}"
-            unverified_count += 1
+            prechecked_no += 1
             continue
-        
-        # Build verification prompt
-        claims_text = "\n".join([
-            f"- [{c['id']}] {c['claim']}" 
-            for c in segment["cited_claims"]
-        ])
-        
-        verification_prompt = f"""You are a precise fact-checking AI. Your task is to verify if the OUTPUT TEXT accurately reflects the CITED EVIDENCE.
 
-OUTPUT TEXT:
-"{segment['text']}"
+        precheck = _rule_precheck(segment)
+        if precheck["status"] == "Yes":
+            segment["verified"] = "Yes"
+            segment["verification_reason"] = precheck["reason"]
+            prechecked_yes += 1
+        elif precheck["status"] == "No":
+            segment["verified"] = "No"
+            segment["verification_reason"] = precheck["reason"]
+            prechecked_no += 1
+        else:
+            uncertain_segments.append({"segment": segment, "precheck": precheck})
 
-CITED EVIDENCE CLAIMS:
-{claims_text}
+    print(f"Rule precheck results: Yes={prechecked_yes}, No={prechecked_no}, Uncertain={len(uncertain_segments)}")
 
-INSTRUCTIONS:
-- Check if the factual claims in the OUTPUT TEXT are supported by the CITED EVIDENCE
-- The wording doesn't need to be identical - paraphrasing is acceptable if the meaning is preserved
-- Verify that no contradicting or unsupported claims are made
-- Focus on semantic accuracy, not exact word matching
+    if uncertain_segments and use_llm_for_uncertain:
+        print(f"\nVerifying uncertain segments in batches using {verification_model} (batch_size={batch_size})...")
+        for start in range(0, len(uncertain_segments), batch_size):
+            batch = uncertain_segments[start:start + batch_size]
+            payload_items = []
+            for item in batch:
+                segment = item["segment"]
+                payload_items.append({
+                    "segment_number": segment["segment_number"],
+                    "text": segment["text"],
+                    "citations": segment["citations"],
+                    "cited_claims": [
+                        {"id": c["id"], "claim": c.get("claim", "")} for c in segment.get("cited_claims", [])
+                    ]
+                })
 
-IMPORTANT: Be reasonable - if the output text is a valid paraphrase or accurate representation of the evidence, it should be VERIFIED.
-
-Respond with EXACTLY ONE of these formats:
-- "VERIFIED" (if the text accurately reflects the evidence, even if paraphrased)
-- "UNVERIFIED: [specific reason]" (only if there are clear inaccuracies or unsupported claims)
-
-Your response:"""
-
-        try:
-            response = azure_llm_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": verification_prompt}],
-                max_completion_tokens=200
+            verification_prompt = (
+                "You are a precise fact-checking AI. Verify whether each segment is supported by its cited evidence. "
+                "Return ONLY a JSON array of objects with keys: segment_number (int), verdict ('VERIFIED' or 'UNVERIFIED'), "
+                "reason (short string).\n\n"
+                f"BATCH_INPUT:\n{json.dumps(payload_items, ensure_ascii=False)}"
             )
-            
-            verification_result = response.choices[0].message.content.strip()
-            
-            # Remove surrounding quotes if present
-            if verification_result.startswith('"') and verification_result.endswith('"'):
-                verification_result = verification_result[1:-1]
-            
-            # Debug: Print first few responses
-            if i <= 3:
-                print(f"    [DEBUG] Segment {i} LLM response: {verification_result[:150]}")
-            
-            if verification_result.upper().startswith("VERIFIED"):
-                segment["verified"] = "Yes"
-                segment["verification_reason"] = "Claims match cited evidence"
-                verified_count += 1
-            else:
-                segment["verified"] = "No"
-                # Extract reason after "UNVERIFIED:"
-                if "UNVERIFIED:" in verification_result.upper():
-                    reason = verification_result.split(":", 1)[1].strip() if ":" in verification_result else verification_result
-                else:
-                    reason = verification_result
-                segment["verification_reason"] = reason if reason else "Claims do not match cited evidence"
-                unverified_count += 1
-                
-        except Exception as e:
-            segment["verified"] = "Error"
-            segment["verification_reason"] = f"Verification failed: {str(e)}"
-            unverified_count += 1
-        
-        # Progress indicator
-        if i % 5 == 0:
-            print(f"  Verified {i}/{len(segments)} segments...")
+
+            try:
+                response = azure_llm_client.chat.completions.create(
+                    model=verification_model,
+                    messages=[{"role": "user", "content": verification_prompt}],
+                    max_completion_tokens=800,
+                )
+                usage = getattr(response, "usage", None)
+                if usage:
+                    token_usage_summary["api_calls"] += 1
+                    token_usage_summary["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+                    token_usage_summary["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+                    details = getattr(usage, "completion_tokens_details", None)
+                    if details:
+                        token_usage_summary["reasoning_tokens"] += int(getattr(details, "reasoning_tokens", 0) or 0)
+                content = _clean_json_text(response.choices[0].message.content)
+                parsed = json.loads(content)
+                if not isinstance(parsed, list):
+                    raise ValueError("Batch verification returned non-list JSON")
+                _apply_llm_batch_results(batch, parsed)
+            except Exception as batch_error:
+                # Fallback: mark batch as uncertain error to avoid silent false positives
+                for item in batch:
+                    item["segment"]["verified"] = "Error"
+                    item["segment"]["verification_reason"] = f"Batch verification failed: {str(batch_error)}"
+
+    elif uncertain_segments:
+        for item in uncertain_segments:
+            item["segment"]["verified"] = "Error"
+            item["segment"]["verification_reason"] = "LLM verification disabled for uncertain segment"
+
+    verified_count = sum(1 for s in segments if s.get("verified") == "Yes")
+    unverified_count = sum(1 for s in segments if s.get("verified") in {"No", "Error"})
     
     print(f"\nVerification complete!")
     print(f"  Verified: {verified_count}")
@@ -2912,19 +3765,49 @@ Your response:"""
         "unverified_segments": unverified_count,
         "verification_rate": f"{verification_rate:.1f}%",
         "segments": segments,
-        "is_sentence_level": sentence_level  # IMPROVEMENT #4: Flag for sentence-level verification
+        "is_sentence_level": sentence_level,  # IMPROVEMENT #4: Flag for sentence-level verification
+        "token_usage": token_usage_summary,
     }
+
+
+def select_stage1_iterations(query_text: str, input_sources: Dict[str, Any]) -> int:
+    """
+    Select Stage 1 iteration count automatically based on request complexity.
+
+    Heuristic:
+    - Base: 1 iteration (fast default)
+    - +1 if links/attachments are present
+    - +1 if many sources or long/complex query
+    - Clamp to 1..3
+    """
+    links = input_sources.get("links") or []
+    attachments = input_sources.get("attachments") or []
+    topic = str(input_sources.get("topics") or "").strip()
+
+    score = 1
+
+    if links or attachments:
+        score += 1
+
+    if len(links) >= 4 or len(attachments) >= 2 or len(query_text) > 220:
+        score += 1
+
+    if topic and len(topic) > 120 and score < 3:
+        score += 1
+
+    return max(1, min(3, score))
 
 
 async def process_with_iterative_refinement_and_style(
     query: str,
     sources: Dict[str, Any],
-    max_iterations: int = 3,
+    max_iterations: Optional[int] = None,
     max_output_length: int = 16000,
     context_details: str = "",
     style: Optional[Dict[str, Any]] = None,
     enable_policy_check: bool = True,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    operating_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Complete pipeline: Iterative refinement + Style-based output generation + Policy check.
@@ -2941,6 +3824,10 @@ async def process_with_iterative_refinement_and_style(
     Returns:
         Complete results including refined summary, styled output, and policy check
     """
+    pipeline_started_at = time.perf_counter()
+    stage_elapsed_seconds: Dict[str, float] = {}
+    stage_token_usage: Dict[str, Dict[str, int]] = {}
+
     def emit(event_type: str, **payload):
         if progress_callback:
             try:
@@ -2948,8 +3835,114 @@ async def process_with_iterative_refinement_and_style(
             except Exception:
                 pass
 
+    def _record_stage_elapsed(stage_key: str, started_at: float) -> None:
+        stage_elapsed_seconds[stage_key] = time.perf_counter() - started_at
+
+    def _merge_stage_token_usage(stage_key: str, usage: Optional[Dict[str, Any]]) -> None:
+        if not usage or not isinstance(usage, dict):
+            return
+
+        stage_token_usage.setdefault(stage_key, {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "api_calls": 0,
+        })
+
+        for key in ["prompt_tokens", "completion_tokens", "reasoning_tokens", "api_calls"]:
+            stage_token_usage[stage_key][key] += int(usage.get(key, 0) or 0)
+
+    def _print_performance_telemetry() -> None:
+        print("\n" + "=" * 70)
+        print("PERFORMANCE TELEMETRY (TERMINAL)")
+        print("=" * 70)
+
+        total_elapsed = time.perf_counter() - pipeline_started_at
+        print(f"Total elapsed: {total_elapsed:.2f}s")
+
+        if stage_elapsed_seconds:
+            print("\nStage elapsed:")
+            ordered_stages = ["stage1", "stage1_escalated", "stage2", "stage3", "stage4", "stage5", "stage6", "stage7"]
+            for stage_key in ordered_stages:
+                if stage_key in stage_elapsed_seconds:
+                    print(f"  - {stage_key}: {stage_elapsed_seconds[stage_key]:.2f}s")
+
+        total_prompt = 0
+        total_completion = 0
+        total_reasoning = 0
+        total_calls = 0
+
+        if stage_token_usage:
+            print("\nToken usage:")
+            for stage_key in ["stage3", "stage4", "stage5", "stage6", "stage7"]:
+                usage = stage_token_usage.get(stage_key)
+                if not usage:
+                    continue
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+                reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+                api_calls = int(usage.get("api_calls", 0) or 0)
+                print(
+                    f"  - {stage_key}: prompt={prompt_tokens}, completion={completion_tokens}, "
+                    f"reasoning={reasoning_tokens}, calls={api_calls}"
+                )
+                total_prompt += prompt_tokens
+                total_completion += completion_tokens
+                total_reasoning += reasoning_tokens
+                total_calls += api_calls
+
+        print(
+            f"\nToken totals: prompt={total_prompt}, completion={total_completion}, "
+            f"reasoning={total_reasoning}, calls={total_calls}"
+        )
+        print("=" * 70)
+
+    def _parse_percent_value(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace("%", "")
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _parse_int_env(name: str, default_value: int, minimum: int = 1, maximum: int = 7) -> int:
+        raw = os.getenv(name, str(default_value))
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            parsed = default_value
+        return max(minimum, min(maximum, parsed))
+
+    resolved_mode = (operating_mode or os.getenv("WRITER_OPERATING_MODE", "fast")).strip().lower()
+    if resolved_mode not in {"fast", "standard"}:
+        resolved_mode = "fast"
+
+    fast_mode_enabled = resolved_mode == "fast"
+    emit("stage_text", stage=1, text=f"Operating mode: {resolved_mode}")
+
+    fast_deep_loops = _parse_int_env("FAST_MODE_DEEP_RESEARCH_LOOPS", 2)
+    standard_deep_loops = _parse_int_env("STANDARD_MODE_DEEP_RESEARCH_LOOPS", 3)
+
+    os.environ["DEEP_RESEARCH_MAX_LOOPS"] = str(fast_deep_loops if fast_mode_enabled else standard_deep_loops)
+    emit("stage_text", stage=1, text=f"Deep research loops: {os.getenv('DEEP_RESEARCH_MAX_LOOPS')}")
+
+    if max_iterations is None:
+        if fast_mode_enabled:
+            max_iterations = 1
+        else:
+            max_iterations = max(2, select_stage1_iterations(query, sources))
+        print(f"[INFO] Stage 1 iterations selected automatically: {max_iterations}")
+        emit("stage_text", stage=1, text=f"Configured iterations: {max_iterations} (auto-selected)")
+    else:
+        max_iterations = max(1, min(7, int(max_iterations)))
+        emit("stage_text", stage=1, text=f"Configured iterations: {max_iterations}")
+
     # Step 1: Iterative refinement
     emit("stage_started", stage=1)
+    stage1_started_at = time.perf_counter()
     print(f"\n{'='*70}")
     print("STEP 1: ITERATIVE REFINEMENT")
     print('='*70)
@@ -2984,11 +3977,13 @@ async def process_with_iterative_refinement_and_style(
         emit("stage_metric", stage=1, key="Other Evidence", value=other_evidence_count)
 
     emit("stage_done", stage=1)
+    _record_stage_elapsed("stage1", stage1_started_at)
     
     # Get final summary
     final_summary = refinement_results["final_summary"].get("summary", "")
     
     if not final_summary:
+        _print_performance_telemetry()
         return {
             **refinement_results,
             "styled_output": {
@@ -2999,6 +3994,7 @@ async def process_with_iterative_refinement_and_style(
     
     # Step 2: Get writing style
     emit("stage_started", stage=2)
+    stage2_started_at = time.perf_counter()
     print(f"\n{'='*70}")
     print("STEP 2: RETRIEVING WRITING STYLE")
     print('='*70)
@@ -3016,16 +4012,24 @@ async def process_with_iterative_refinement_and_style(
             print("✗ No style found in database, using default formatting")
             emit("stage_text", stage=2, text="No style found in database, using default formatting")
     emit("stage_done", stage=2)
+    _record_stage_elapsed("stage2", stage2_started_at)
     
     # Step 3: Generate styled output
     emit("stage_started", stage=3)
+    stage3_started_at = time.perf_counter()
+    stage3_paused_seconds = 0.0
+    if fast_mode_enabled:
+        print("[FAST PASS] Running provisional Stage 2/3 quality gate before potential standard escalation.")
+        emit("stage_text", stage=3, text="Fast-pass quality gate run")
     print(f"\n{'='*70}")
     print("STEP 3: GENERATING STYLED OUTPUT")
     print('='*70)
     
     # Get cumulative evidence store for citation validation
     cumulative_evidence = refinement_results.get("cumulative_evidence_store", [])
+    generation_evidence = prune_evidence_for_generation(query, cumulative_evidence)
     print(f"[DEBUG] Evidence store size: {len(cumulative_evidence)} items")
+    print(f"[DEBUG] Generation evidence size (pruned): {len(generation_evidence)} items")
     print(f"[DEBUG] Final summary length: {len(final_summary)} chars")
     
     styled_result = await generate_styled_output(
@@ -3034,9 +4038,10 @@ async def process_with_iterative_refinement_and_style(
         style,
         context_details=context_details,
         max_output_length=max_output_length,
-        evidence_store=cumulative_evidence,
+        evidence_store=generation_evidence,
         use_claim_outline=True  # IMPROVEMENT #1: Explicitly enable claim-based styling
     )
+    _merge_stage_token_usage("stage3", styled_result.get("token_usage"))
     
     if styled_result.get("success"):
         print(f"✓ Styled output generated successfully")
@@ -3061,12 +4066,107 @@ async def process_with_iterative_refinement_and_style(
     else:
         print(f"✗ Style generation failed: {styled_result.get('error', 'Unknown')}")
         emit("stage_text", stage=3, text=f"Style generation failed: {styled_result.get('error', 'Unknown')}")
+    fast_mode_escalated = False
+    if styled_result.get("success") and fast_mode_enabled:
+        try:
+            min_coverage_threshold = float(os.getenv("FAST_MODE_MIN_CITATION_COVERAGE", "65"))
+        except ValueError:
+            min_coverage_threshold = 65.0
+
+        max_invalid_citations_before_escalation = _parse_int_env(
+            "FAST_MODE_MAX_INVALID_CITATIONS_BEFORE_ESCALATION",
+            3,
+            minimum=0,
+            maximum=50,
+        )
+
+        citation_coverage = _parse_percent_value(styled_result.get("citation_coverage", "0%"))
+        all_citations_valid = bool(styled_result.get("validation", {}).get("all_citations_valid", True))
+        invalid_citation_count = len(styled_result.get("invalid_citations") or [])
+        invalid_citation_escalation = invalid_citation_count > max_invalid_citations_before_escalation
+
+        if citation_coverage < min_coverage_threshold or invalid_citation_escalation:
+            fast_mode_escalated = True
+            emit(
+                "stage_text",
+                stage=3,
+                text=(
+                    f"Fast mode quality gate triggered "
+                    f"(coverage={citation_coverage:.1f}%, invalid_citations={invalid_citation_count}). "
+                    "Escalating to standard mode."
+                ),
+            )
+            print("[QUALITY GATE] Fast mode below threshold after Stage 3, escalating to standard mode")
+            print("[ESCALATION] Re-running Stage 1 in standard mode before final Stage 3 output.")
+            emit("stage_text", stage=1, text="Escalation triggered: standard Stage 1 rerun")
+
+            # Re-run Stage 1 in standard mode only when quality is below threshold
+            escalated_deep_loops = _parse_int_env(
+                "ESCALATED_MODE_DEEP_RESEARCH_LOOPS",
+                2,
+                minimum=1,
+                maximum=5,
+            )
+            os.environ["DEEP_RESEARCH_MAX_LOOPS"] = str(escalated_deep_loops)
+
+            standard_iterations_base = max(2, select_stage1_iterations(query, sources))
+            escalated_max_iterations = _parse_int_env(
+                "ESCALATED_MODE_MAX_ITERATIONS",
+                2,
+                minimum=1,
+                maximum=5,
+            )
+            standard_iterations = min(standard_iterations_base, escalated_max_iterations)
+            emit(
+                "stage_text",
+                stage=1,
+                text=(
+                    f"Escalated mode: standard ({standard_iterations} iterations, "
+                    f"deep_loops={escalated_deep_loops})"
+                ),
+            )
+
+            escalated_stage1_started_at = time.perf_counter()
+            refinement_results = await process_with_iterative_refinement(
+                query,
+                sources,
+                standard_iterations,
+                progress_callback=progress_callback,
+                iteration_prefix="ESCALATED ",
+            )
+            escalated_stage1_elapsed = time.perf_counter() - escalated_stage1_started_at
+            stage_elapsed_seconds["stage1_escalated"] = stage_elapsed_seconds.get("stage1_escalated", 0.0) + escalated_stage1_elapsed
+            stage3_paused_seconds += escalated_stage1_elapsed
+
+            cumulative_evidence = refinement_results.get("cumulative_evidence_store", [])
+            generation_evidence = prune_evidence_for_generation(query, cumulative_evidence)
+            final_summary = refinement_results.get("final_summary", {}).get("summary", "")
+
+            if final_summary:
+                styled_result = await generate_styled_output(
+                    final_summary,
+                    query,
+                    style,
+                    context_details=context_details,
+                    max_output_length=max_output_length,
+                    evidence_store=generation_evidence,
+                    use_claim_outline=True,
+                )
+                _merge_stage_token_usage("stage3", styled_result.get("token_usage"))
+
+                if styled_result.get("success"):
+                    emit("stage_text", stage=3, text="Standard mode styled output generated successfully")
+                    emit("stage_metric", stage=3, key="Citations", value=styled_result.get("citations_found", 0))
+                    emit("stage_metric", stage=3, key="Evidence IDs", value=styled_result.get("unique_evidence_cited", 0))
+
     emit("stage_done", stage=3)
+    stage_elapsed_seconds["stage3"] = max(0.0, (time.perf_counter() - stage3_started_at) - stage3_paused_seconds)
     
     # Step 4: Verify citations in styled output
     verification_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=4)
+        stage4_started_at = time.perf_counter()
         print(f"\n{'='*70}")
         print("STEP 4: VERIFYING STYLED OUTPUT CITATIONS")
         print('='*70)
@@ -3077,6 +4177,7 @@ async def process_with_iterative_refinement_and_style(
                 evidence_store=cumulative_evidence,
                 sentence_level=True  # IMPROVEMENT #4: Use sentence-level verification
             )
+            _merge_stage_token_usage("stage4", verification_result.get("token_usage"))
             
             print(f"\n✓ Citation verification complete")
             print(f"  Total segments: {verification_result.get('total_segments')}")
@@ -3128,6 +4229,7 @@ async def process_with_iterative_refinement_and_style(
                         evidence_store=cumulative_evidence,
                         sentence_level=True
                     )
+                    _merge_stage_token_usage("stage4", verification_result.get("token_usage"))
                     print(f"[AUTO-FIX] After fixes - Verified: {verification_result.get('verified_segments')}/{verification_result.get('total_segments')} segments")
                 else:
                     print(f"[AUTO-FIX] ⚠️ Could not apply fixes: {fix_result.get('error', 'Unknown')}")
@@ -3144,11 +4246,13 @@ async def process_with_iterative_refinement_and_style(
                 "unverified_segments": 0
             }
             emit("stage_done", stage=4)
+        _record_stage_elapsed("stage4", stage4_started_at)
     
     # Step 5: Convert to APA format
     apa_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=5)
+        stage5_started_at = time.perf_counter()
         print(f"\n{'='*70}")
         print("STEP 5: CONVERTING TO APA FORMAT")
         print('='*70)
@@ -3177,11 +4281,13 @@ async def process_with_iterative_refinement_and_style(
                 "apa_output": styled_result.get("styled_output", "")  # Fallback to original
             }
             emit("stage_done", stage=5)
+        _record_stage_elapsed("stage5", stage5_started_at)
     
     # Step 6: Plagiarism Detection
     plagiarism_result = None
     if styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=6)
+        stage6_started_at = time.perf_counter()
         print(f"\n{'='*70}")
         print("STEP 6: PLAGIARISM DETECTION")
         print('='*70)
@@ -3204,7 +4310,7 @@ async def process_with_iterative_refinement_and_style(
             
             # Prepare speech metadata
             speech_metadata = {
-                "id": hashlib.md5(styled_result.get("styled_output", "").encode()).hexdigest()[:16],
+                "id": hashlib.sha256(styled_result.get("styled_output", "").encode()).hexdigest()[:16],
                 "query": query,
                 "speaker": style.get("speaker") if style else None,
                 "institution": "Analysis",
@@ -3295,11 +4401,13 @@ async def process_with_iterative_refinement_and_style(
             if tavily_client:
                 await tavily_client.close()
         emit("stage_done", stage=6)
+        _record_stage_elapsed("stage6", stage6_started_at)
     
     # Step 7: BSP Policy Alignment Check
     policy_check_result = None
     if enable_policy_check and styled_result.get("success"):
         emit("stage_started", stage=7)
+        stage7_started_at = time.perf_counter()
         print(f"\n{'='*70}")
         print("STEP 7: BSP POLICY ALIGNMENT CHECK")
         print('='*70)
@@ -3313,25 +4421,51 @@ async def process_with_iterative_refinement_and_style(
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "query": query
             }
-            max_policy_fix_rounds = 3
+            max_policy_fix_rounds = _parse_int_env("STAGE7_MAX_POLICY_FIX_ROUNDS", 1, minimum=0, maximum=3)
+            max_policy_issues_for_fix = _parse_int_env("STAGE7_MAX_POLICY_ISSUES_FOR_FIX", 5, minimum=1, maximum=15)
+            min_fix_severity = os.getenv("STAGE7_MIN_FIX_SEVERITY", "high").strip().lower()
+            min_fix_rank = _severity_rank(min_fix_severity)
+            if min_fix_rank <= 0:
+                min_fix_rank = _severity_rank("high")
             policy_fix_round = 0
             total_policy_fixes = 0
+            policy_pass_count = 0
+            max_policy_passes = max_policy_fix_rounds + 1
+            last_policy_signature = None
 
             while True:
+                if policy_pass_count >= max_policy_passes:
+                    print(f"[POLICY] Max verification passes reached ({max_policy_passes}).")
+                    emit("stage_text", stage=7, text=f"Policy max verification passes reached ({max_policy_passes})")
+                    break
+
+                policy_pass_count += 1
+
                 # Determine which version of the speech to check (prefer APA if available)
                 speech_to_check = (
                     apa_result.get("apa_output") if apa_result and apa_result.get("success")
                     else styled_result.get("styled_output", "")
                 )
 
-                print(f"\n[POLICY] Verification pass {policy_fix_round + 1}/{max_policy_fix_rounds + 1}")
-                emit("stage_text", stage=7, text=f"Policy verification pass {policy_fix_round + 1}")
+                print(f"\n[POLICY] Verification pass {policy_pass_count}/{max_policy_passes}")
+                emit("stage_text", stage=7, text=f"Policy verification pass {policy_pass_count}")
 
-                # Run policy alignment check using Azure Agent
-                policy_check_result = await check_speech_policy_alignment(
-                    speech_content=speech_to_check,
-                    speech_metadata=speech_metadata
-                )
+                policy_cache_key = _build_policy_cache_key(speech_to_check, speech_metadata)
+                cached_policy_result = _get_cached_policy_check(policy_cache_key)
+                if cached_policy_result:
+                    policy_check_result = cached_policy_result
+                    print("[POLICY CACHE] HIT")
+                    emit("stage_text", stage=7, text="Policy cache hit")
+                else:
+                    # Run policy alignment check using Azure Agent
+                    policy_check_result = await check_speech_policy_alignment(
+                        speech_content=speech_to_check,
+                        speech_metadata=speech_metadata
+                    )
+                    if policy_check_result.get("success"):
+                        _set_cached_policy_check(policy_cache_key, policy_check_result)
+                        print("[POLICY CACHE] MISS → STORED")
+                        emit("stage_text", stage=7, text="Policy cache miss; stored result")
 
                 if not policy_check_result.get("success"):
                     print(f"✗ Policy check failed: {policy_check_result.get('error', 'Unknown')}")
@@ -3347,6 +4481,13 @@ async def process_with_iterative_refinement_and_style(
 
                 effective_requires_revision = bool(policy_check_result.get('requires_revision')) or has_high_or_critical
                 policy_check_result['requires_revision'] = effective_requires_revision
+
+                current_policy_signature = _policy_result_signature(policy_check_result)
+                if last_policy_signature and current_policy_signature == last_policy_signature:
+                    print("[POLICY] No material policy change from prior pass; stopping recheck loop.")
+                    emit("stage_text", stage=7, text="Policy unchanged after prior pass; stopping")
+                    break
+                last_policy_signature = current_policy_signature
 
                 # Preserve checker's compliance label when provided; fallback only if missing.
                 if not policy_check_result.get('overall_compliance'):
@@ -3420,28 +4561,36 @@ async def process_with_iterative_refinement_and_style(
 
                 # AUTO-FIX: Revise policy violations
                 violations = policy_check_result.get('violations', [])
+                actionable_violations = [
+                    v for v in violations
+                    if _severity_rank(v.get("severity", "")) >= min_fix_rank
+                ]
 
                 # Build issues list for fix_speech_issues (only when revision is truly required)
                 policy_issues = []
-                if violations:
-                    print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(violations)} policy violations...")
-                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Attempting policy fix for {len(violations)} violations")
-                    for violation in violations[:10]:  # Limit to top 10
+                if actionable_violations:
+                    print(f"\n[AUTO-FIX] 🔧 Attempting to fix {len(actionable_violations)} actionable policy violations...")
+                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Attempting policy fix for {len(actionable_violations)} actionable violations")
+                    for violation in actionable_violations[:max_policy_issues_for_fix]:
                         policy_issues.append({
                             "segment": violation.get("problematic_text", "") or speech_to_check[:700],
                             "issue_description": f"{violation.get('violation_type', 'Unknown')}: {violation.get('description', '')}",
                             "suggestion": violation.get("suggested_fix", "Revise to align with BSP policy guidelines"),
                             "severity": violation.get("severity", "MEDIUM").upper()
                         })
-                else:
-                    print("\n[AUTO-FIX] 🔧 Needs revision flagged without detailed violations; attempting holistic policy fix...")
-                    emit("stage_text", stage=7, text="[AUTO-FIX] Needs revision flagged; attempting holistic policy fix")
+                elif has_high_or_critical:
+                    print("\n[AUTO-FIX] ⚠️ High/critical issues flagged but no actionable details; running one holistic policy fix.")
+                    emit("stage_text", stage=7, text="[AUTO-FIX] Running holistic policy fix for high/critical issue")
                     policy_issues.append({
                         "segment": speech_to_check[:900],
-                        "issue_description": f"Policy check flagged needs revision (compliance: {policy_check_result.get('overall_compliance', 'unknown')})",
+                        "issue_description": f"Policy check flagged high-risk revision need (compliance: {policy_check_result.get('overall_compliance', 'unknown')})",
                         "suggestion": policy_check_result.get("recommendation", "Revise wording to align with BSP policy requirements and reduce non-compliant phrasing."),
-                        "severity": "MEDIUM"
+                        "severity": "HIGH"
                     })
+                else:
+                    print(f"[AUTO-FIX] Skipping auto-fix: no violations at or above '{min_fix_severity}'.")
+                    emit("stage_text", stage=7, text=f"[AUTO-FIX] Skipping; no violations >= {min_fix_severity}")
+                    break
 
                 # Call fix function
                 fix_result = await fix_speech_issues(
@@ -3453,6 +4602,12 @@ async def process_with_iterative_refinement_and_style(
                 )
 
                 if fix_result.get("success") and fix_result.get("fixes_applied") > 0:
+                    fixed_speech = fix_result.get("fixed_speech", "")
+                    if not fixed_speech or fixed_speech.strip() == speech_to_check.strip():
+                        print("[AUTO-FIX] No material speech change detected after fix; stopping recheck loop.")
+                        emit("stage_text", stage=7, text="[AUTO-FIX] No material change after fix; stopping")
+                        break
+
                     policy_fix_round += 1
                     total_policy_fixes += fix_result.get("fixes_applied", 0)
                     print(f"[AUTO-FIX] ✅ Applied {fix_result['fixes_applied']} policy fixes (round {policy_fix_round})")
@@ -3462,11 +4617,11 @@ async def process_with_iterative_refinement_and_style(
 
                     # Update the appropriate result before re-verifying
                     if apa_result and apa_result.get("success"):
-                        apa_result["apa_output"] = fix_result["fixed_speech"]
+                        apa_result["apa_output"] = fixed_speech
                         print(f"[AUTO-FIX] Updated APA output with policy fixes")
                         emit("stage_text", stage=7, text="[AUTO-FIX] Updated APA output with policy fixes")
                     else:
-                        styled_result["styled_output"] = fix_result["fixed_speech"]
+                        styled_result["styled_output"] = fixed_speech
                         print(f"[AUTO-FIX] Updated styled output with policy fixes")
                         emit("stage_text", stage=7, text="[AUTO-FIX] Updated styled output with policy fixes")
 
@@ -3490,6 +4645,7 @@ async def process_with_iterative_refinement_and_style(
             }
             emit("stage_text", stage=7, text=f"Policy alignment check failed: {str(e)}")
         emit("stage_done", stage=7)
+        _record_stage_elapsed("stage7", stage7_started_at)
     elif not enable_policy_check:
         print(f"\n{'='*70}")
         print("STEP 7: BSP POLICY ALIGNMENT CHECK - SKIPPED")
@@ -3508,8 +4664,15 @@ async def process_with_iterative_refinement_and_style(
             "name": style.get("name", "None") if style else "None",
             "speaker": style.get("speaker", "None") if style else "None",
             "audience": style.get("audience_setting_classification", "None") if style else "None"
-        }
+        },
+        "performance_telemetry": {
+            "elapsed_seconds": stage_elapsed_seconds,
+            "token_usage": stage_token_usage,
+            "total_elapsed_seconds": time.perf_counter() - pipeline_started_at,
+        },
     }
+
+    _print_performance_telemetry()
     
     return complete_results
 

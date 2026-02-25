@@ -88,7 +88,7 @@ def trace(col2, label, message):
 
 # get request api
 def get_request(url):
-    response = requests.get(url)
+    response = requests.get(url, timeout=10)
     return response.json()
 
 
