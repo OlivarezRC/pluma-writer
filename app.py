@@ -4,6 +4,8 @@ import app.utils as utils
 import app.prompts as prompts
 import json
 import html
+import logging
+import traceback
 from PyPDF2 import PdfReader
 from docx import Document
 from pptx import Presentation
@@ -21,6 +23,45 @@ from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import os
+
+
+logger = logging.getLogger("pluma.writer")
+
+
+def _configure_runtime_logging() -> None:
+    configured_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, configured_level, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        force=True,
+    )
+    logger.info("Runtime logging initialized at level=%s", logging.getLevelName(level))
+
+
+def _log_startup_diagnostics() -> None:
+    required_env_vars = [
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_KEY",
+        "AZURE_OPENAI_CHAT_DEPLOYMENT",
+    ]
+    missing_vars = [name for name in required_env_vars if not os.getenv(name)]
+
+    if missing_vars:
+        logger.error("Missing required environment variables: %s", ", ".join(missing_vars))
+    else:
+        logger.info("Required Azure OpenAI environment variables detected")
+
+    logger.info(
+        "Deployment config chat=%s stage3=%s stage4=%s",
+        os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "<unset>"),
+        os.getenv("AZURE_OPENAI_STAGE3_DEPLOYMENT", "<unset>"),
+        os.getenv("AZURE_OPENAI_STAGE4_DEPLOYMENT", "<unset>"),
+    )
+
+
+_configure_runtime_logging()
+_log_startup_diagnostics()
 
 
 def speech_body_length(text: str) -> int:
@@ -846,7 +887,7 @@ if st.button(
 
         stage_placeholders = {i: st.empty() for i in range(1, 8)}
         event_queue = queue.Queue()
-        result_holder = {"results": None, "error": None}
+        result_holder = {"results": None, "error": None, "traceback": None}
 
         def render_stage(stage_num: int):
             state = stage_store[stage_num]
@@ -1096,7 +1137,13 @@ if st.button(
                     builtins.print = original_print
                 except Exception:
                     pass
-                event_queue.put({"type": "pipeline_error", "error": str(exc)})
+                error_traceback = traceback.format_exc()
+                logger.exception("Writer pipeline worker failed")
+                event_queue.put({
+                    "type": "pipeline_error",
+                    "error": str(exc),
+                    "traceback": error_traceback,
+                })
 
         st.markdown("### 🔄 Writer Pipeline Running...")
         st.markdown("---")
@@ -1189,6 +1236,7 @@ if st.button(
                         stage_store[3]["initial_output_preview"] = styled_output[:280]
                 elif event_type == "pipeline_error":
                     result_holder["error"] = event.get("error", "Unknown pipeline error")
+                    result_holder["traceback"] = event.get("traceback")
                     # Mark current incomplete stages as error
                     for i in range(1, 8):
                         if stage_store[i]["status"] in ["pending", "running"]:
@@ -1203,6 +1251,9 @@ if st.button(
 
         if result_holder["error"]:
             st.error(f"Pipeline failed: {result_holder['error']}")
+            if result_holder.get("traceback"):
+                with st.expander("🐛 Error Traceback", expanded=True):
+                    st.code(result_holder["traceback"])
             st.stop()
 
         results = result_holder["results"]
@@ -2159,12 +2210,12 @@ if st.button(
         except Exception as e:
             # Restore original print on error
             builtins.print = original_print
+            logger.exception("Pipeline failed in enhanced stage-card flow")
             
             # Mark current stage as error
             if progress_capture.current_stage > 0:
                 update_stage_card(progress_capture.current_stage, 'error', stage_names[progress_capture.current_stage])
             
             st.error(f"❌ Pipeline failed: {str(e)}")
-            import traceback
             with st.expander("🐛 Error Details", expanded=True):
                 st.code(traceback.format_exc())
