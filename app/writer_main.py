@@ -350,6 +350,264 @@ def build_style_digest(style: Dict[str, Any]) -> Dict[str, str]:
     return digest
 
 
+def _extract_evidence_citations(text: str) -> List[str]:
+    return re.findall(r'\[E\d+(?:,E\d+)*\]', text or "")
+
+
+def _extract_apa_parenthetical_citations(text: str) -> List[str]:
+    return re.findall(r'\((?=[^)]*\b(?:\d{4}[a-z]?|n\.d\.)\b)[^)]*\)', text or "", flags=re.IGNORECASE)
+
+
+def _extract_locked_citations(text: str) -> List[str]:
+    evidence = _extract_evidence_citations(text)
+    apa_parenthetical = _extract_apa_parenthetical_citations(text)
+    return evidence + apa_parenthetical
+
+
+def _extract_numeric_tokens(text: str) -> List[str]:
+    return re.findall(r'\b\d[\d,]*(?:\.\d+)?%?\b', text or "")
+
+
+def _paragraph_count(text: str) -> int:
+    if not text or not text.strip():
+        return 0
+    return len([block for block in re.split(r'\n\s*\n', text.strip()) if block.strip()])
+
+
+def _has_references_section(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r'\n(?:=+\n)?\s*REFERENCES\s*\n(?:=+\n)?', text, flags=re.IGNORECASE))
+
+
+async def reapply_style_coat_strict(
+    speech_text: str,
+    style: Dict[str, Any],
+    context_details: str = "",
+) -> Dict[str, Any]:
+    """
+    Re-apply style/guidelines as a final polish pass while strictly preserving content.
+    Falls back to original text when deterministic content-lock checks fail.
+    """
+    if not speech_text or not speech_text.strip():
+        return {
+            "success": True,
+            "applied": False,
+            "output": speech_text,
+            "fallback_reason": "empty_speech",
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
+        }
+
+    style = style or {}
+    style_digest = build_style_digest(style)
+    style_text = style_digest.get("style_text", "")
+    global_rules = style_digest.get("global_rules", "")
+    guidelines = style_digest.get("guidelines", "")
+    example = style_digest.get("example", "")
+
+    if not any([style_text.strip(), global_rules.strip(), guidelines.strip(), example.strip()]):
+        return {
+            "success": True,
+            "applied": False,
+            "output": speech_text,
+            "fallback_reason": "no_style_instructions",
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
+        }
+
+    token_usage_summary = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "api_calls": 0,
+    }
+
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
+            api_key=os.getenv("AZURE_OPENAI_KEY"),
+        )
+        model = os.getenv("AZURE_OPENAI_STAGE3_DEPLOYMENT") or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
+
+        system_parts = [
+            "You are a precision style finisher. Apply style as a thin coat of paint only.\n",
+            f"<writingStyle>{style_text}</writingStyle>\n",
+            f"<globalRules>{global_rules}</globalRules>\n",
+            f"<writingGuidelines>{guidelines}</writingGuidelines>\n",
+        ]
+        if example:
+            system_parts.append(f"<writingExample>{example}</writingExample>\n")
+
+        system_parts.extend([
+            "CONTENT-LOCK RULES (MANDATORY):\n",
+            "1. Keep the same factual meaning sentence-by-sentence.\n",
+            "2. Do NOT add, remove, or alter facts, numbers, dates, names, entities, or claims.\n",
+            "3. Keep citations exactly intact (same citation markers and references).\n",
+            "4. Keep paragraph order and paragraph count unchanged.\n",
+            "5. Keep section headers and references section present exactly as in input.\n",
+            "6. Keep legal/policy modality unchanged (must/should/may) unless already in the input.\n",
+            "7. Do not insert new recommendations, caveats, examples, or conclusions.\n",
+            "8. Use plain-language wording so non-technical listeners can understand the speech.\n",
+            "9. Avoid research-paper / RRL tone; keep it as spoken speech with natural flow.\n",
+            "10. Simplify jargon by rephrasing in common words, but do NOT change technical meaning.\n",
+            "11. Keep tone formal, clear, and audience-friendly; do not sound like an academic abstract.\n",
+            "12. If any requested style instruction conflicts with content lock, prioritize content lock.\n",
+            "Return ONLY the fully rewritten speech text, no explanations.\n",
+        ])
+
+        system_prompt = "".join(system_parts)
+        user_prompt = (
+            "Apply a final style coat to the speech below using the provided style instructions.\n"
+            "This is a style-only pass with strict content lock.\n\n"
+            f"Optional context: {context_details.strip() if context_details and context_details.strip() else 'Not provided'}\n\n"
+            "<SPEECH_TO_POLISH>\n"
+            f"{speech_text}\n"
+            "</SPEECH_TO_POLISH>\n"
+        )
+
+        max_completion_tokens = max(2000, min(9000, int(len(speech_text) * 0.9)))
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_completion_tokens=max_completion_tokens,
+        )
+
+        usage = getattr(response, "usage", None)
+        if usage:
+            token_usage_summary["api_calls"] += 1
+            token_usage_summary["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            token_usage_summary["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+            details = getattr(usage, "completion_tokens_details", None)
+            if details:
+                token_usage_summary["reasoning_tokens"] += int(getattr(details, "reasoning_tokens", 0) or 0)
+
+        candidate = (response.choices[0].message.content or "").strip()
+        if not candidate:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "empty_model_output",
+                "token_usage": token_usage_summary,
+            }
+
+        if "<think>" in candidate and "</think>" in candidate:
+            while "<think>" in candidate and "</think>" in candidate:
+                start = candidate.find("<think>")
+                end = candidate.find("</think>") + 8
+                candidate = (candidate[:start] + candidate[end:]).strip()
+
+        original_citations = _extract_locked_citations(speech_text)
+        candidate_citations = _extract_locked_citations(candidate)
+        original_numbers = _extract_numeric_tokens(speech_text)
+        candidate_numbers = _extract_numeric_tokens(candidate)
+
+        original_paragraphs = _paragraph_count(speech_text)
+        candidate_paragraphs = _paragraph_count(candidate)
+
+        original_has_refs = _has_references_section(speech_text)
+        candidate_has_refs = _has_references_section(candidate)
+
+        original_len = max(1, len(speech_text))
+        candidate_len = len(candidate)
+        len_ratio = candidate_len / original_len
+
+        if original_citations and candidate_citations != original_citations:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "citations_changed",
+                "token_usage": token_usage_summary,
+                "validation": {
+                    "original_citations": len(original_citations),
+                    "candidate_citations": len(candidate_citations),
+                },
+            }
+
+        if candidate_numbers != original_numbers:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "numeric_content_changed",
+                "token_usage": token_usage_summary,
+                "validation": {
+                    "original_numbers": len(original_numbers),
+                    "candidate_numbers": len(candidate_numbers),
+                },
+            }
+
+        if candidate_paragraphs != original_paragraphs:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "paragraph_structure_changed",
+                "token_usage": token_usage_summary,
+                "validation": {
+                    "original_paragraphs": original_paragraphs,
+                    "candidate_paragraphs": candidate_paragraphs,
+                },
+            }
+
+        if candidate_has_refs != original_has_refs:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "references_section_changed",
+                "token_usage": token_usage_summary,
+                "validation": {
+                    "original_has_references": original_has_refs,
+                    "candidate_has_references": candidate_has_refs,
+                },
+            }
+
+        if len_ratio < 0.85 or len_ratio > 1.15:
+            return {
+                "success": True,
+                "applied": False,
+                "output": speech_text,
+                "fallback_reason": "length_drift_too_high",
+                "token_usage": token_usage_summary,
+                "validation": {
+                    "original_length": original_len,
+                    "candidate_length": candidate_len,
+                    "length_ratio": round(len_ratio, 4),
+                },
+            }
+
+        return {
+            "success": True,
+            "applied": candidate.strip() != speech_text.strip(),
+            "output": candidate,
+            "fallback_reason": "",
+            "token_usage": token_usage_summary,
+            "validation": {
+                "original_length": original_len,
+                "candidate_length": candidate_len,
+                "length_ratio": round(len_ratio, 4),
+                "citations_preserved": True,
+                "numbers_preserved": True,
+                "paragraphs_preserved": True,
+                "references_preserved": True,
+            },
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "applied": False,
+            "output": speech_text,
+            "fallback_reason": f"style_recoat_failed: {e}",
+            "token_usage": token_usage_summary,
+        }
+
+
 def prune_evidence_for_generation(query: str, evidence_store: List[Dict[str, Any]], max_items: int = 30) -> List[Dict[str, Any]]:
     if not evidence_store:
         return []
@@ -3874,7 +4132,7 @@ async def process_with_iterative_refinement_and_style(
 
         if stage_token_usage:
             print("\nToken usage:")
-            for stage_key in ["stage3", "stage4", "stage5", "stage6", "stage7"]:
+            for stage_key in ["stage3", "stage4", "stage5", "stage6", "stage7", "stage7_recoat"]:
                 usage = stage_token_usage.get(stage_key)
                 if not usage:
                     continue
@@ -4405,6 +4663,13 @@ async def process_with_iterative_refinement_and_style(
     
     # Step 7: BSP Policy Alignment Check
     policy_check_result = None
+    style_recoat_result = {
+        "success": True,
+        "applied": False,
+        "output": "",
+        "fallback_reason": "not_run",
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
+    }
     if enable_policy_check and styled_result.get("success"):
         emit("stage_started", stage=7)
         stage7_started_at = time.perf_counter()
@@ -4632,6 +4897,58 @@ async def process_with_iterative_refinement_and_style(
                 print(f"[AUTO-FIX] ⚠️ Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
                 emit("stage_text", stage=7, text=f"[AUTO-FIX] Could not apply policy fixes: {fix_result.get('error', 'Unknown')}")
                 break
+
+            # Final style-only polish after policy checks/fixes
+            style_coat_source = ""
+            style_coat_target = ""
+            if apa_result and apa_result.get("success") and apa_result.get("apa_output"):
+                style_coat_source = apa_result.get("apa_output", "")
+                style_coat_target = "apa_output"
+            elif styled_result.get("success") and styled_result.get("styled_output"):
+                style_coat_source = styled_result.get("styled_output", "")
+                style_coat_target = "styled_output"
+
+            if style_coat_source and style:
+                print("\n[STYLE RECOAT] Re-applying selected style + editorial guidelines (style-only, content-locked)...")
+                emit("stage_text", stage=7, text="Post-policy style recoat started (content-locked)")
+
+                style_recoat_result = await reapply_style_coat_strict(
+                    speech_text=style_coat_source,
+                    style=style,
+                    context_details=context_details,
+                )
+                _merge_stage_token_usage("stage7_recoat", style_recoat_result.get("token_usage"))
+
+                if style_recoat_result.get("success") and style_recoat_result.get("applied"):
+                    recoated_text = style_recoat_result.get("output", style_coat_source)
+                    if style_coat_target == "apa_output" and apa_result is not None:
+                        apa_result["apa_output"] = recoated_text
+                    elif style_coat_target == "styled_output":
+                        styled_result["styled_output"] = recoated_text
+                    print("[STYLE RECOAT] ✅ Applied successfully with content-lock checks passed")
+                    emit("stage_text", stage=7, text="Post-policy style recoat applied")
+                else:
+                    fallback_reason = style_recoat_result.get("fallback_reason", "unknown")
+                    print(f"[STYLE RECOAT] ⚠️ Skipped/fallback to original: {fallback_reason}")
+                    emit("stage_text", stage=7, text=f"Post-policy style recoat skipped: {fallback_reason}")
+            elif not style:
+                style_recoat_result = {
+                    "success": True,
+                    "applied": False,
+                    "output": style_coat_source,
+                    "fallback_reason": "no_style_selected",
+                    "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
+                }
+                emit("stage_text", stage=7, text="Post-policy style recoat skipped: no style selected")
+            else:
+                style_recoat_result = {
+                    "success": True,
+                    "applied": False,
+                    "output": "",
+                    "fallback_reason": "no_output_available",
+                    "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
+                }
+                emit("stage_text", stage=7, text="Post-policy style recoat skipped: no output available")
                 
         except Exception as e:
             print(f"✗ Policy alignment check failed: {str(e)}")
@@ -4660,6 +4977,7 @@ async def process_with_iterative_refinement_and_style(
         "citation_verification": verification_result,
         "plagiarism_analysis": plagiarism_result,
         "policy_check": policy_check_result,
+        "style_recoat": style_recoat_result,
         "style_used": {
             "name": style.get("name", "None") if style else "None",
             "speaker": style.get("speaker", "None") if style else "None",
