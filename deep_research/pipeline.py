@@ -36,16 +36,6 @@ def _get_max_research_loops() -> int:
         parsed = 3
     return max(1, min(7, parsed))
 
-
-def _get_max_search_results() -> int:
-    """Get Tavily max results per loop from env, with safe defaults."""
-    raw_value = os.getenv("DEEP_RESEARCH_MAX_RESULTS", "4")
-    try:
-        parsed = int(raw_value)
-    except (TypeError, ValueError):
-        parsed = 4
-    return max(1, min(8, parsed))
-
 def _get_model(task_tier: str = "light"):
     """
     Lazy initialization of deep-research model.
@@ -144,9 +134,10 @@ async def generate_query(state: SummaryState, notify: Notifier = None):
 async def web_research(state: SummaryState, notify: Notifier = None):
     tavily_client = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     try:
-        max_results = _get_max_search_results()
+        # Tavily rejects queries longer than 400 characters
+        search_query = state.search_query[:400] if state.search_query else state.research_topic[:400]
         res = await tavily_client.search(
-            state.search_query, max_results=max_results,
+            search_query, max_results=3,
             max_tokens_per_source=1000, include_raw_content=False, include_images=True
         )
 

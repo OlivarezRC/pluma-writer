@@ -1075,34 +1075,27 @@ def _split_topic_for_parallel_processing(topic_text: str, max_parts: int = 3, mi
     return unique_parts[:max(1, max_parts)]
 
 
-def _extract_deep_research_sources(summary_text: str) -> List[Dict[str, str]]:
-    """Extract bullet-style source entries emitted by deep_research finalize step."""
-    if not summary_text or "Sources:" not in summary_text:
-        return []
-
+def _parse_deep_research_sources(summary: str) -> List[Dict[str, str]]:
+    """
+    Extract source URLs and titles from the '### Sources:' section appended by
+    deep_research.pipeline.finalize_summary.
+    Each line has the format:  '* Title : https://...'
+    """
     sources: List[Dict[str, str]] = []
-    seen_urls = set()
-
-    for line in summary_text.splitlines():
-        stripped = (line or "").strip()
-        if not stripped.startswith("*"):
-            continue
-
-        match = re.match(r"^\*\s*(.+?)\s*:\s*(https?://\S+)\s*$", stripped)
-        if not match:
-            continue
-
-        title = match.group(1).strip()
-        url = match.group(2).strip().rstrip('.,;)')
-        if not url or url in seen_urls:
-            continue
-
-        seen_urls.add(url)
-        sources.append({
-            "source_title": title,
-            "source_url": url,
-        })
-
+    block_match = re.search(
+        r'###\s*Sources:\s*\n(.*?)(?:\n##|\Z)',
+        summary,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not block_match:
+        return sources
+    for line in block_match.group(1).splitlines():
+        line = line.strip().lstrip('*').strip()
+        if ' : ' in line:
+            title_part, url_part = line.split(' : ', 1)
+            url_part = url_part.strip()
+            if url_part.startswith('http'):
+                sources.append({"title": title_part.strip(), "url": url_part})
     return sources
 
 
@@ -1128,11 +1121,9 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
         }
 
     topic_cache_key = _stable_json_hash({
-        "topic_cache_schema": 2,
         "query": query,
         "topic": topic.strip(),
         "deep_research_max_loops": os.getenv("DEEP_RESEARCH_MAX_LOOPS", "3"),
-        "deep_research_max_results": os.getenv("DEEP_RESEARCH_MAX_RESULTS", "4"),
     })
     cached_topic_result = _get_stage1_cache("topic", topic_cache_key)
     if cached_topic_result:
@@ -1156,8 +1147,15 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
         # Extract atomic claims from summary
         evidence_store = []
         evidence_id = evidence_id_start
-        extracted_sources = _extract_deep_research_sources(research_summary)
-        
+
+        # Parse actual source URLs from the '### Sources:' block in the summary
+        parsed_sources = _parse_deep_research_sources(research_summary)
+        print(f"[topic_processing] Parsed {len(parsed_sources)} sources from deep-research summary")
+        sources_context = "\n".join(
+            f"{i+1}. {s['url']} ({s['title']})"
+            for i, s in enumerate(parsed_sources)
+        ) if parsed_sources else "Not available"
+
         # Use LLM to extract atomic claims
         model = _get_link_processing_model("light")
         
@@ -1166,23 +1164,24 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
 - Self-contained and verifiable
 - Include the exact quote span that supports it
 - Include bibliographic metadata for APA citations
+- Be attributed to the most relevant source URL from the list below
+
+Available source URLs (use these for the source_url field):
+{sources_context}
 
 Research Summary:
 {research_summary[:4000]}
-
-Available Sources (use these when assigning source_title/source_url):
-{json.dumps(extracted_sources[:12], ensure_ascii=False, indent=2)}
 
 Return a JSON array where each item has:
 - "claim": the atomic factual statement
 - "quote_span": exact excerpt from text that supports this claim (20-100 words)
 - "confidence": your confidence (0.0-1.0) that this is factually grounded
-- "source_title": best-matching source title from Available Sources (or "Unknown")
-- "source_url": best-matching source URL from Available Sources (or null)
-- "author": author name(s) if mentioned in text (e.g., "Smith", "Jones & Brown", or "n.d." if not found)
+- "author": author name(s) if mentioned (e.g., "Smith", "Jones & Brown", or "n.d." if not found)
 - "year": publication year if mentioned (e.g., "2023" or "n.d." if not found)
 - "publication": publication/source name if mentioned (e.g., journal, website, organization)
 - "publisher": publisher or organization name if mentioned
+- "source_url": the EXACT URL from the Available source URLs list that best matches this claim (copy it verbatim, or null if none match)
+- "source_title": the title from the list above that corresponds to the source_url
 
 Return ONLY the JSON array, no other text."""
         
@@ -1201,37 +1200,28 @@ Return ONLY the JSON array, no other text."""
                 content = content.split('</think>')[-1].strip()
             
             claims = json.loads(content)
-
-            if isinstance(claims, dict):
-                claims = claims.get("claims", [])
-            if not isinstance(claims, list):
-                claims = []
             
             # Create evidence items with stable IDs and APA metadata
-            for claim_index, claim_data in enumerate(claims):
-                if not isinstance(claim_data, dict):
-                    continue
-
-                assigned_title = claim_data.get("source_title")
-                assigned_url = claim_data.get("source_url")
-                if (not assigned_url) and extracted_sources:
-                    fallback_source = extracted_sources[claim_index % len(extracted_sources)]
-                    assigned_title = assigned_title or fallback_source.get("source_title")
-                    assigned_url = fallback_source.get("source_url")
-
-                if not assigned_title:
-                    assigned_title = topic
-
+            for claim_idx, claim_data in enumerate(claims):
+                # Use LLM-attributed URL; fall back to round-robin across parsed sources
+                item_source_url = claim_data.get("source_url")
+                item_source_title = claim_data.get("source_title")
+                if not item_source_url and parsed_sources:
+                    fallback = parsed_sources[claim_idx % len(parsed_sources)]
+                    item_source_url = fallback["url"]
+                    item_source_title = item_source_title or fallback["title"]
+                if not item_source_title:
+                    item_source_title = topic
                 evidence_store.append({
                     "id": f"E{evidence_id}",
                     "claim": claim_data.get("claim", ""),
-                    "source": assigned_title,
-                    "source_url": assigned_url,
-                    "source_title": assigned_title,
+                    "source": item_source_url or f"Deep Research: {topic}",
+                    "source_url": item_source_url,
+                    "source_title": item_source_title,
                     "quote_span": claim_data.get("quote_span", ""),
                     "author": claim_data.get("author", "n.d."),
                     "year": claim_data.get("year", "n.d."),
-                    "publication": claim_data.get("publication", assigned_title),
+                    "publication": claim_data.get("publication", item_source_title),
                     "publisher": claim_data.get("publisher", "n.d."),
                     "retrieval_context": "deep_research_pipeline",
                     "confidence": claim_data.get("confidence", 0.8),
@@ -1241,16 +1231,18 @@ Return ONLY the JSON array, no other text."""
                 
         except Exception as e:
             print(f"Error extracting atomic claims: {e}")
-            # Fallback: create evidence from substantial paragraphs
+            # Fallback: evidence from paragraphs, round-robin source URLs
             paragraphs = [p.strip() for p in research_summary.split('\n\n') if len(p.strip()) > 100]
-            for para in paragraphs[:5]:
+            for para_idx, para in enumerate(paragraphs[:5]):
                 if not para.startswith('#'):
+                    fallback_url = parsed_sources[para_idx % len(parsed_sources)]["url"] if parsed_sources else None
+                    fallback_title = parsed_sources[para_idx % len(parsed_sources)]["title"] if parsed_sources else topic
                     evidence_store.append({
                         "id": f"E{evidence_id}",
                         "claim": para[:200] + "..." if len(para) > 200 else para,
-                        "source": f"Deep Research: {topic}",
-                        "source_url": None,
-                        "source_title": topic,
+                        "source": fallback_url or f"Deep Research: {topic}",
+                        "source_url": fallback_url,
+                        "source_title": fallback_title,
                         "quote_span": para,
                         "retrieval_context": "deep_research_pipeline",
                         "confidence": 0.7,
@@ -1406,34 +1398,74 @@ async def process_links(
                             )
                             await asyncio.sleep(wait_ms / 1000.0)
 
-                    if last_extract_error is not None:
-                        raise last_extract_error
+                    # --- Determine raw content from extract result or fall back to search ---
+                    _extract_ok = (
+                        last_extract_error is None
+                        and search_result
+                        and search_result.get("results")
+                        and len(search_result.get("results", [])) > 0
+                    )
 
-                    if not search_result or not search_result.get("results") or len(search_result.get("results", [])) == 0:
+                    raw_content = ""
+                    title = "Unknown"
+
+                    if _extract_ok:
+                        _res0 = search_result["results"][0]
+                        raw_content = _res0.get("raw_content", "") or ""
+                        title = _res0.get("title", "Unknown")
+                        # Detect navigation-only HTML: strip markdown/symbols and check real text length
+                        _text_only = re.sub(r'[#\[\]()!*_`|<>{}=\\]', ' ', raw_content)
+                        _text_only = ' '.join(_text_only.split())
+                        if len(_text_only) < 250:
+                            _extract_ok = False  # treat as failed — content is just navigation chrome
+
+                    if not _extract_ok:
+                        # Fall back to Tavily search to get a snippet/summary for paywalled / JS-heavy pages
+                        _search_hint = title if (title and title != "Unknown") else link
+                        try:
+                            _fb_res = await tavily_client.search(
+                                _search_hint,
+                                max_results=1,
+                                max_tokens_per_source=1500,
+                                include_raw_content=True,
+                            )
+                            _fb_results = _fb_res.get("results", [])
+                            if _fb_results:
+                                _fb = _fb_results[0]
+                                _fb_content = _fb.get("raw_content") or _fb.get("content") or ""
+                                _fb_title = _fb.get("title") or title
+                                if len(_fb_content) > len(raw_content):
+                                    raw_content = _fb_content
+                                    title = _fb_title
+                                    print(f"[Stage 1] Used search fallback for {link} (title: {title[:60]})")
+                        except Exception as _fb_err:
+                            print(f"[Stage 1] Search fallback failed for {link}: {_fb_err}")
+
+                    # If we still have no usable content, emit a stub reference for this URL
+                    if not raw_content or len(raw_content.strip()) < 50:
+                        print(f"[Stage 1] No content for {link} — creating stub reference")
                         return {
                             "index": index,
                             "processed_link": {
                                 "url": link,
-                                "status": "error",
-                                "error": "Could not extract content"
+                                "status": "stub",
+                                "claims_extracted": 1,
+                                "title": title
                             },
-                            "claims": []
-                        }
-
-                    # Get extracted content
-                    result = search_result["results"][0]
-                    raw_content = result.get("raw_content", "")
-                    title = result.get("title", "Unknown")
-
-                    if not raw_content or len(raw_content.strip()) == 0:
-                        return {
-                            "index": index,
-                            "processed_link": {
-                                "url": link,
-                                "status": "error",
-                                "error": "Empty content"
-                            },
-                            "claims": []
+                            "claims": [{
+                                "claim": f"Source referenced: {title}",
+                                "source": link,
+                                "source_url": link,
+                                "source_title": title,
+                                "quote_span": title,
+                                "author": "n.d.",
+                                "year": "n.d.",
+                                "publication": title,
+                                "publisher": "n.d.",
+                                "retrieval_context": "link_stub",
+                                "confidence": 0.3,
+                                "timestamp_accessed": datetime.now().isoformat()
+                            }]
                         }
 
                     # Truncate if too long
@@ -1508,6 +1540,24 @@ Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
                             "timestamp_accessed": datetime.now().isoformat()
                         })
 
+                    # If LLM returned no relevant claims, add a stub so URL still appears in references
+                    if not extracted_claims:
+                        print(f"[Stage 1] LLM returned 0 claims for {link} — adding stub reference")
+                        extracted_claims.append({
+                            "claim": f"Source referenced: {title}",
+                            "source": link,
+                            "source_url": link,
+                            "source_title": title,
+                            "quote_span": title,
+                            "author": "n.d.",
+                            "year": "n.d.",
+                            "publication": title,
+                            "publisher": "n.d.",
+                            "retrieval_context": "link_stub",
+                            "confidence": 0.3,
+                            "timestamp_accessed": datetime.now().isoformat()
+                        })
+
                     print(f"✓ Extracted {len(extracted_claims)} atomic claims from {link}")
                     return {
                         "index": index,
@@ -1523,14 +1573,29 @@ Return ONLY a JSON array of claims. Extract 3-8 most relevant atomic facts."""
             except Exception as e:
                 error_msg = str(e)
                 print(f"✗ Error processing {link}: {error_msg}")
+                # Even on hard failure, emit a stub so all input URLs appear in references
                 return {
                     "index": index,
                     "processed_link": {
                         "url": link,
-                        "status": "error",
-                        "error": f"Could not extract content: {error_msg}"
+                        "status": "stub",
+                        "claims_extracted": 1,
+                        "title": link
                     },
-                    "claims": []
+                    "claims": [{
+                        "claim": f"Source referenced: {link}",
+                        "source": link,
+                        "source_url": link,
+                        "source_title": link,
+                        "quote_span": link,
+                        "author": "n.d.",
+                        "year": "n.d.",
+                        "publication": link,
+                        "publisher": "n.d.",
+                        "retrieval_context": "link_stub",
+                        "confidence": 0.3,
+                        "timestamp_accessed": datetime.now().isoformat()
+                    }]
                 }
 
         link_results = await asyncio.gather(
@@ -3579,8 +3644,11 @@ async def convert_styled_output_to_apa(
             "source_title": source_title
         }
         
-        # Group by unique source for deduplication
-        source_key = (display_author, year, source_url if source_url else publication)
+        # Group by unique source for deduplication.
+        # When a URL is present use it as the sole key so that inconsistent
+        # LLM-extracted author/year values across claims from the same page
+        # don't generate multiple reference entries for a single source.
+        source_key = source_url if source_url else (display_author, year, publication)
         if source_key not in source_groups:
             source_groups[source_key] = {
                 "author": display_author,
@@ -3629,24 +3697,28 @@ async def convert_styled_output_to_apa(
     # Step 3: Generate References section with proper APA 7th edition format
     print("\nGenerating APA 7th edition references list...")
     
-    # Get unique citations used in the text
+    # Include ALL unique sources from the evidence store in references,
+    # not just ones cited in the generated text, so every provided URL appears.
+    all_source_keys = set(source_groups.keys())
+
+    # Also track which are actually cited (for future use / ordering)
     all_citations_in_text = re.findall(citation_pattern, styled_output)
     cited_ids = set()
     for citation in all_citations_in_text:
         ids = re.findall(r'E\d+', citation)
         cited_ids.update(ids)
-    
-    # Find which unique sources were actually cited
-    cited_sources = set()
+    cited_source_keys = set()
     for eid in cited_ids:
         if eid in citation_map:
             info = citation_map[eid]
-            source_key = (info['author'], info['year'], info['source_url'] if info['source_url'] else info['publication'])
-            cited_sources.add(source_key)
-    
-    # Build references list (one entry per unique source)
+            source_key = info['source_url'] if info['source_url'] else (info['author'], info['year'], info['publication'])
+            cited_source_keys.add(source_key)
+
+    # Build references list (one entry per unique source) — cited ones first
     references = []
-    for source_key in sorted(cited_sources, key=lambda x: (x[0], x[1])):
+    ordered_keys = sorted(cited_source_keys, key=lambda x: str(x)) + \
+                   sorted(all_source_keys - cited_source_keys, key=lambda x: str(x))
+    for source_key in ordered_keys:
         source_info = source_groups[source_key]
         
         author = source_info['author']
