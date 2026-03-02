@@ -38,7 +38,16 @@ from app.policy_checker import check_speech_policy_alignment
 
 
 # Model initialization for link processing - lazy loaded (tier/deployment aware)
+# Cache is keyed by deployment + asyncio loop id to avoid cross-loop client reuse.
 _link_processing_models: Dict[str, AzureAIChatCompletionsModel] = {}
+
+
+def _current_loop_cache_scope() -> str:
+    try:
+        loop = asyncio.get_running_loop()
+        return f"loop:{id(loop)}"
+    except RuntimeError:
+        return "loop:none"
 
 # Optional persistent cache container (Cosmos)
 _stage1_cache_container = None
@@ -656,7 +665,7 @@ def _get_link_processing_model(tier: str = "light"):
     }
 
     _model_name = deployment_by_tier.get(tier, deployment_by_tier["light"])
-    model_key = f"{tier}:{_model_name}"
+    model_key = f"{tier}:{_model_name}:{_current_loop_cache_scope()}"
 
     if model_key in _link_processing_models:
         return _link_processing_models[model_key]
