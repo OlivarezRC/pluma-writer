@@ -28,6 +28,30 @@ import os
 logger = logging.getLogger("pluma.writer")
 
 
+def _sanitize_streamlit_theme_env_vars() -> list[str]:
+    removed_keys: list[str] = []
+    for key, value in list(os.environ.items()):
+        if key.startswith("STREAMLIT_THEME_") and not str(value).strip():
+            os.environ.pop(key, None)
+            removed_keys.append(key)
+    return removed_keys
+
+
+def _log_streamlit_theme_overrides() -> None:
+    theme_keys = sorted(key for key in os.environ.keys() if key.startswith("STREAMLIT_THEME_"))
+    if not theme_keys:
+        logger.info("No STREAMLIT_THEME_* environment overrides detected")
+        return
+
+    logger.info("Detected %d STREAMLIT_THEME_* environment override(s)", len(theme_keys))
+    for key in theme_keys:
+        value = os.getenv(key, "")
+        if not value.strip():
+            logger.warning("Empty Streamlit theme override detected: %s", key)
+        else:
+            logger.info("Streamlit theme override: %s=%s", key, value)
+
+
 def _configure_runtime_logging() -> None:
     configured_level = os.getenv("APP_LOG_LEVEL", "INFO").upper()
     level = getattr(logging, configured_level, logging.INFO)
@@ -37,6 +61,14 @@ def _configure_runtime_logging() -> None:
         force=True,
     )
     logger.info("Runtime logging initialized at level=%s", logging.getLevelName(level))
+
+    removed_theme_keys = _sanitize_streamlit_theme_env_vars()
+    if removed_theme_keys:
+        logger.warning(
+            "Removed %d empty STREAMLIT_THEME_* environment override(s): %s",
+            len(removed_theme_keys),
+            ", ".join(sorted(removed_theme_keys)),
+        )
 
 
 def _log_startup_diagnostics() -> None:
@@ -58,6 +90,7 @@ def _log_startup_diagnostics() -> None:
         os.getenv("AZURE_OPENAI_STAGE3_DEPLOYMENT", "<unset>"),
         os.getenv("AZURE_OPENAI_STAGE4_DEPLOYMENT", "<unset>"),
     )
+    _log_streamlit_theme_overrides()
 
 
 _configure_runtime_logging()

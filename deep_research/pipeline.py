@@ -134,8 +134,10 @@ async def generate_query(state: SummaryState, notify: Notifier = None):
 async def web_research(state: SummaryState, notify: Notifier = None):
     tavily_client = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     try:
+        # Tavily rejects queries longer than 400 characters
+        search_query = state.search_query[:400] if state.search_query else state.research_topic[:400]
         res = await tavily_client.search(
-            state.search_query, max_results=1,
+            search_query, max_results=3,
             max_tokens_per_source=1000, include_raw_content=False, include_images=True
         )
 
