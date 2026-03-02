@@ -1075,6 +1075,37 @@ def _split_topic_for_parallel_processing(topic_text: str, max_parts: int = 3, mi
     return unique_parts[:max(1, max_parts)]
 
 
+def _extract_deep_research_sources(summary_text: str) -> List[Dict[str, str]]:
+    """Extract bullet-style source entries emitted by deep_research finalize step."""
+    if not summary_text or "Sources:" not in summary_text:
+        return []
+
+    sources: List[Dict[str, str]] = []
+    seen_urls = set()
+
+    for line in summary_text.splitlines():
+        stripped = (line or "").strip()
+        if not stripped.startswith("*"):
+            continue
+
+        match = re.match(r"^\*\s*(.+?)\s*:\s*(https?://\S+)\s*$", stripped)
+        if not match:
+            continue
+
+        title = match.group(1).strip()
+        url = match.group(2).strip().rstrip('.,;)')
+        if not url or url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        sources.append({
+            "source_title": title,
+            "source_url": url,
+        })
+
+    return sources
+
+
 async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -> Dict[str, Any]:
     """
     Process a topic by calling deep_research module.
@@ -1097,9 +1128,11 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
         }
 
     topic_cache_key = _stable_json_hash({
+        "topic_cache_schema": 2,
         "query": query,
         "topic": topic.strip(),
         "deep_research_max_loops": os.getenv("DEEP_RESEARCH_MAX_LOOPS", "3"),
+        "deep_research_max_results": os.getenv("DEEP_RESEARCH_MAX_RESULTS", "4"),
     })
     cached_topic_result = _get_stage1_cache("topic", topic_cache_key)
     if cached_topic_result:
@@ -1123,6 +1156,7 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
         # Extract atomic claims from summary
         evidence_store = []
         evidence_id = evidence_id_start
+        extracted_sources = _extract_deep_research_sources(research_summary)
         
         # Use LLM to extract atomic claims
         model = _get_link_processing_model("light")
@@ -1136,10 +1170,15 @@ async def topic_processing(topic: str, query: str, evidence_id_start: int = 1) -
 Research Summary:
 {research_summary[:4000]}
 
+Available Sources (use these when assigning source_title/source_url):
+{json.dumps(extracted_sources[:12], ensure_ascii=False, indent=2)}
+
 Return a JSON array where each item has:
 - "claim": the atomic factual statement
 - "quote_span": exact excerpt from text that supports this claim (20-100 words)
 - "confidence": your confidence (0.0-1.0) that this is factually grounded
+- "source_title": best-matching source title from Available Sources (or "Unknown")
+- "source_url": best-matching source URL from Available Sources (or null)
 - "author": author name(s) if mentioned in text (e.g., "Smith", "Jones & Brown", or "n.d." if not found)
 - "year": publication year if mentioned (e.g., "2023" or "n.d." if not found)
 - "publication": publication/source name if mentioned (e.g., journal, website, organization)
@@ -1162,19 +1201,37 @@ Return ONLY the JSON array, no other text."""
                 content = content.split('</think>')[-1].strip()
             
             claims = json.loads(content)
+
+            if isinstance(claims, dict):
+                claims = claims.get("claims", [])
+            if not isinstance(claims, list):
+                claims = []
             
             # Create evidence items with stable IDs and APA metadata
-            for claim_data in claims:
+            for claim_index, claim_data in enumerate(claims):
+                if not isinstance(claim_data, dict):
+                    continue
+
+                assigned_title = claim_data.get("source_title")
+                assigned_url = claim_data.get("source_url")
+                if (not assigned_url) and extracted_sources:
+                    fallback_source = extracted_sources[claim_index % len(extracted_sources)]
+                    assigned_title = assigned_title or fallback_source.get("source_title")
+                    assigned_url = fallback_source.get("source_url")
+
+                if not assigned_title:
+                    assigned_title = topic
+
                 evidence_store.append({
                     "id": f"E{evidence_id}",
                     "claim": claim_data.get("claim", ""),
-                    "source": f"Deep Research: {topic}",
-                    "source_url": None,
-                    "source_title": topic,
+                    "source": assigned_title,
+                    "source_url": assigned_url,
+                    "source_title": assigned_title,
                     "quote_span": claim_data.get("quote_span", ""),
                     "author": claim_data.get("author", "n.d."),
                     "year": claim_data.get("year", "n.d."),
-                    "publication": claim_data.get("publication", topic),
+                    "publication": claim_data.get("publication", assigned_title),
                     "publisher": claim_data.get("publisher", "n.d."),
                     "retrieval_context": "deep_research_pipeline",
                     "confidence": claim_data.get("confidence", 0.8),
