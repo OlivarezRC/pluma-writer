@@ -15,7 +15,16 @@ from .formatting import deduplicate_and_format_sources, format_sources
 from .states import SummaryState, SummaryStateInput, SummaryStateOutput
 
 # Model initialization - lazy loaded to avoid import-time connection
+# Cache is loop-scoped so async clients are not reused across different event loops.
 _deep_research_models: Dict[str, AzureAIChatCompletionsModel] = {}
+
+
+def _current_loop_cache_scope() -> str:
+    try:
+        loop = asyncio.get_running_loop()
+        return f"loop:{id(loop)}"
+    except RuntimeError:
+        return "loop:none"
 
 
 def _get_max_research_loops() -> int:
@@ -45,8 +54,10 @@ def _get_model(task_tier: str = "light"):
     }
     _model_name = model_map.get(task_tier, model_map["light"])
 
-    if _model_name in _deep_research_models:
-        return _deep_research_models[_model_name]
+    model_key = f"{_model_name}:{_current_loop_cache_scope()}"
+
+    if model_key in _deep_research_models:
+        return _deep_research_models[model_key]
     
     # Get environment variables
     _endpoint = os.getenv("AZURE_INFERENCE_ENDPOINT")
@@ -71,7 +82,7 @@ def _get_model(task_tier: str = "light"):
         model=_model_name,
     )
 
-    _deep_research_models[_model_name] = model_instance
+    _deep_research_models[model_key] = model_instance
     return model_instance
 
 # notifier: async callback(event_name:str, payload:dict) -> None
