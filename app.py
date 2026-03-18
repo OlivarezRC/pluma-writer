@@ -1348,6 +1348,9 @@ if st.button(
                     use_container_width=True,
                     key="download_final_pdf"
                 )
+
+            # Save style writer output to Cosmos DB
+            utils.save_style_writer_output(final_output_text, user_query)
         else:
             st.warning("No final output text was produced by the pipeline.")
 

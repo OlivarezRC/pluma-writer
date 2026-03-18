@@ -718,6 +718,7 @@ if st.button(
                 context_details,
             )
             utils.save_output(output, content_all)
+            utils.save_style_refiner_output(output, content_all)
 
             # --- NEW: cache for later & build filenames ---
             st.session_state["last_output_refiner"] = output

@@ -44,6 +44,14 @@ def ensure_containers_exist():
             {
                 "name": "outputs",
                 "partition_key": PartitionKey(path="/user_id")
+            },
+            {
+                "name": "stylewriteroutput",
+                "partition_key": PartitionKey(path="/user_id")
+            },
+            {
+                "name": "stylerefineroutput",
+                "partition_key": PartitionKey(path="/user_id")
             }
         ]
         
@@ -77,6 +85,8 @@ ensure_containers_exist()
 # Get container references after ensuring they exist
 styles_container = database.get_container_client("styles_from_speeches")
 outputs_container = database.get_container_client("outputs")
+style_writer_output_container = database.get_container_client("stylewriteroutput")
+style_refiner_output_container = database.get_container_client("stylerefineroutput")
 
 # log tracing
 def trace(col2, label, message):
@@ -323,6 +333,52 @@ def save_output(output, content_all):
         st.error(f"An error occurred while saving output: {e}")
 
 
+def save_style_writer_output(output, content, pdf_url="", docx_url=""):
+    try:
+        headers = st.context.headers
+        user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
+        user_name = headers.get('X-MS-CLIENT-PRINCIPAL-NAME', 'r0bai')
+
+        now = datetime.now()
+        new_output = {
+            "id": str(int(time.time() * 1000)),
+            "updatedAt": now.isoformat(),
+            "content": content,
+            "styleId": st.session_state.get("styleId", ""),
+            "output": output,
+            "user_id": user_id,
+            "user_name": user_name,
+            "pdf": pdf_url,
+            "docx": docx_url,
+        }
+        style_writer_output_container.create_item(body=new_output)
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while saving style writer output: {e}")
+
+
+def save_style_refiner_output(output, content, pdf_url="", docx_url=""):
+    try:
+        headers = st.context.headers
+        user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
+        user_name = headers.get('X-MS-CLIENT-PRINCIPAL-NAME', 'r0bai')
+
+        now = datetime.now()
+        new_output = {
+            "id": str(int(time.time() * 1000)),
+            "updatedAt": now.isoformat(),
+            "content": content,
+            "styleId": st.session_state.get("styleId", ""),
+            "output": output,
+            "user_id": user_id,
+            "user_name": user_name,
+            "pdf": pdf_url,
+            "docx": docx_url,
+        }
+        style_refiner_output_container.create_item(body=new_output)
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while saving style refiner output: {e}")
+
+
 # get outputs from database
 def get_outputs():
     try:
@@ -350,7 +406,8 @@ def get_outputs():
         # Delete older items
         for item in items_to_delete:
             outputs_container.delete_item(
-                item=item['id']
+                item=item['id'],
+                partition_key=item['user_id']
             )
         
         # Convert to DataFrame and select only specific columns
@@ -360,3 +417,51 @@ def get_outputs():
         st.dataframe(df)
     except exceptions.CosmosHttpResponseError as e:
         st.error(f"An error occurred while fetching outputs: {e}")
+
+
+def _get_outputs_from_container(container, display_columns=None):
+    """Fetch outputs from a given Cosmos container and return as a DataFrame."""
+    if display_columns is None:
+        display_columns = ['updatedAt', 'user_name', 'styleId', 'content', 'output', 'pdf', 'docx']
+    try:
+        headers = st.context.headers
+        user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
+
+        if not user_id:
+            return None
+
+        query = "SELECT * FROM c WHERE c.user_id = @user_id ORDER BY c.updatedAt DESC"
+        parameters = [{"name": "@user_id", "value": user_id}]
+        items = list(container.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        ))
+
+        items_to_delete = items[50:]
+        latest_items = items[:50]
+
+        for item in items_to_delete:
+            container.delete_item(
+                item=item['id'],
+                partition_key=item['user_id']
+            )
+
+        if not latest_items:
+            return None
+
+        df = pd.DataFrame(latest_items)
+        # Only keep columns that exist in the data
+        cols = [c for c in display_columns if c in df.columns]
+        return df[cols] if cols else df
+    except exceptions.CosmosHttpResponseError as e:
+        st.error(f"An error occurred while fetching outputs: {e}")
+        return None
+
+
+def get_style_writer_outputs():
+    return _get_outputs_from_container(style_writer_output_container)
+
+
+def get_style_refiner_outputs():
+    return _get_outputs_from_container(style_refiner_output_container)
