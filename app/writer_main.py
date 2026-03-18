@@ -26,8 +26,7 @@ from deep_research.pipeline import run_deep_research
 
 # Import for link processing
 from tavily import AsyncTavilyClient
-from azure.core.credentials import AzureKeyCredential
-from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
+from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # Import plagiarism checker
@@ -39,7 +38,7 @@ from app.policy_checker import check_speech_policy_alignment
 
 # Model initialization for link processing - lazy loaded (tier/deployment aware)
 # Cache is keyed by deployment + asyncio loop id to avoid cross-loop client reuse.
-_link_processing_models: Dict[str, AzureAIChatCompletionsModel] = {}
+_link_processing_models: Dict[str, AzureAIOpenAIApiChatModel] = {}
 
 
 def _current_loop_cache_scope() -> str:
@@ -654,7 +653,7 @@ def _get_link_processing_model(tier: str = "light"):
     Lazy initialization of model for link processing.
     
     Returns:
-        AzureAIChatCompletionsModel: Initialized model instance
+        AzureAIOpenAIApiChatModel: Initialized model instance
         
     Raises:
         ValueError: If required environment variables are missing
@@ -686,9 +685,9 @@ def _get_link_processing_model(tier: str = "light"):
         )
     
     # Initialize model
-    model_instance = AzureAIChatCompletionsModel(
-        endpoint=_endpoint,
-        credential=AzureKeyCredential(_key),
+    model_instance = AzureAIOpenAIApiChatModel(
+        base_url=_endpoint,
+        api_key=_key,
         model=_model_name,
     )
 

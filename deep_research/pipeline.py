@@ -5,8 +5,7 @@ from typing import Callable, Awaitable, Optional, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
 from tavily import AsyncTavilyClient
-from azure.core.credentials import AzureKeyCredential
-from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel
+from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 
 # --- keep your existing helpers imports ---
 from .prompts import (query_writer_instructions, summarizer_instructions,
@@ -16,7 +15,7 @@ from .states import SummaryState, SummaryStateInput, SummaryStateOutput
 
 # Model initialization - lazy loaded to avoid import-time connection
 # Cache is loop-scoped so async clients are not reused across different event loops.
-_deep_research_models: Dict[str, AzureAIChatCompletionsModel] = {}
+_deep_research_models: Dict[str, AzureAIOpenAIApiChatModel] = {}
 
 
 def _current_loop_cache_scope() -> str:
@@ -42,7 +41,7 @@ def _get_model(task_tier: str = "light"):
     Validates environment variables and initializes model on first use.
     
     Returns:
-        AzureAIChatCompletionsModel: Initialized model instance
+        AzureAIOpenAIApiChatModel: Initialized model instance
         
     Raises:
         ValueError: If required environment variables are missing
@@ -76,9 +75,9 @@ def _get_model(task_tier: str = "light"):
     
     # Initialize model
     # Note: Use 'model' parameter, NOT 'model_name' for Azure AI Inference compatibility
-    model_instance = AzureAIChatCompletionsModel(
-        endpoint=_endpoint,
-        credential=AzureKeyCredential(_key),
+    model_instance = AzureAIOpenAIApiChatModel(
+        base_url=_endpoint,
+        api_key=_key,
         model=_model_name,
     )
 
