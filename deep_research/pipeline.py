@@ -277,9 +277,18 @@ def setup_graph(notify: Notifier = None):        # ✅ accept notify here
     return builder.compile()
 
 async def run_deep_research(topic: str, notify: Notifier = None) -> str:
-    graph = setup_graph(notify=notify)    # ✅ pass notify into setup_graph
+    import logging
+    _logger = logging.getLogger("pluma.deep_research")
+    try:
+        graph = setup_graph(notify=notify)    # ✅ pass notify into setup_graph
 
-    # Option A: just run once and return result (simplest)
-    result = await graph.ainvoke({"research_topic": topic, "images": []})
-    return result.get("running_summary", "")
+        # Option A: just run once and return result (simplest)
+        result = await graph.ainvoke({"research_topic": topic, "images": []})
+        summary = result.get("running_summary", "")
+        if not summary or not summary.strip():
+            _logger.warning("Deep research returned empty summary for topic: %s", topic[:120])
+        return summary
+    except Exception as e:
+        _logger.error("Deep research pipeline failed for topic '%s': %s", topic[:120], e, exc_info=True)
+        return ""
 

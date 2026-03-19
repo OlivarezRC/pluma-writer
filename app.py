@@ -169,9 +169,9 @@ st.text_input(
     key="research_query"
 )
 
-with st.container(border=True):
+with st.expander("📎 Source Materials (Optional: Keywords, Source Links, Upload Attachments)", expanded=False):
     st.info(
-        "Provide at least one source type: **Keywords (for Deep Research)**, **Source Links (URLs)**, or **Upload Attachments**."
+        "Optionally provide source types: **Keywords (for Deep Research)**, **Source Links (URLs)**, or **Upload Attachments**."
     )
 
     # --- two-column layout (Col 1 / Col 2) ---
@@ -227,17 +227,13 @@ with st.container(border=True):
         attachments_filled = bool(st.session_state.get("content_upload"))
         has_any_source = topics_filled or links_filled or attachments_filled
 
-        if not query_filled and not has_any_source:
-            readiness_footer = "You haven't filled either of the three source types and Research Query / Speech Topic"
-        elif not query_filled:
-            readiness_footer = "You still don't have a Research Query / Speech Topic:"
-        elif not has_any_source:
-            readiness_footer = "You still haven't filled either of the three source types"
+        if not query_filled:
+            readiness_footer = "You still need a Research Query / Speech Topic."
         else:
             readiness_footer = "✅ Requirements satisfied."
 
         readiness_text = (
-            ("You are good to go!" if (query_filled and has_any_source) else "Either add a Topics / Keywords to be used for deep research, source links to be searched, or upload attachments to be extracted.") + "\n\n"
+            ("You are good to go!" if query_filled else "Please provide a Research Query / Speech Topic.") + "\n\n"
             f"- {'✅' if query_filled else '⬜'} Research Query / Speech Topic\n"
             f"- {'✅' if topics_filled else '⬜'} Topics / Keywords\n"
             f"- {'✅' if links_filled else '⬜'} Source Links\n"
@@ -245,12 +241,10 @@ with st.container(border=True):
             f"{readiness_footer}"
         )
 
-        if query_filled and has_any_source:
+        if query_filled:
             st.success(readiness_text)
-        elif not query_filled:
-            st.info(readiness_text)
         else:
-            st.warning(readiness_text)
+            st.info(readiness_text)
 
     with col2:
         uploaded_files = st.file_uploader(
@@ -262,63 +256,63 @@ with st.container(border=True):
         )
 
 st.text_area(
-    ":blue[**Setting / Location / Conference / Partners (Optional):**]",
+    ":blue[**Additional Prompt Instructions:**]",
     st.session_state.get("context_details", ""),
     height=90,
-    help="Optional context to guide greetings and speech considerations.",
+    help="Optional additional instructions to guide the speech writing process.",
     key="context_details",
 )
 
-MIN_LEN, MAX_LEN, DEFAULT_LEN = 200, 75_000, 6_000
+MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 40, 15_000, 1_000
 
-# One source of truth
-st.session_state.setdefault("max_len", DEFAULT_LEN)
+# One source of truth (word count)
+st.session_state.setdefault("max_words", DEFAULT_WORDS)
 st.session_state.setdefault("last_updated", None)
 
 def _update_from_slider():
     st.session_state.last_updated = "slider"
-    st.session_state.max_len = st.session_state.max_len_slider
+    st.session_state.max_words = st.session_state.max_words_slider
 
 def _update_from_input():
     st.session_state.last_updated = "input"
-    v = st.session_state.max_len_input
+    v = st.session_state.max_words_input
     # Coerce + clamp
     try:
         v = int(v)
     except Exception:
-        v = MIN_LEN
-    st.session_state.max_len = max(MIN_LEN, min(MAX_LEN, v))
+        v = MIN_WORDS
+    st.session_state.max_words = max(MIN_WORDS, min(MAX_WORDS, v))
 
 # Keep both widgets synced to the source of truth (avoid ping-pong)
 if st.session_state.last_updated != "slider":
-    st.session_state["max_len_slider"] = st.session_state.max_len
+    st.session_state["max_words_slider"] = st.session_state.max_words
 if st.session_state.last_updated != "input":
-    st.session_state["max_len_input"] = st.session_state.max_len
+    st.session_state["max_words_input"] = st.session_state.max_words
 
 col_slider, col_input = st.columns([3, 1])
 
 with col_slider:
     st.slider(
-        ":blue[**Output Maximum Character Length (75,000 Maximum):**]",
-        min_value=MIN_LEN,
-        max_value=MAX_LEN,
-        key="max_len_slider",
+        ":blue[**Output Maximum Word Length ({MAX_WORDS:,} Maximum):**]",
+        min_value=MIN_WORDS,
+        max_value=MAX_WORDS,
+        key="max_words_slider",
         on_change=_update_from_slider,
         disabled=False,
     )
 
 with col_input:
-    st.number_input(   # use number_input for clean integer UX
-        "No. of Characters",
-        min_value=MIN_LEN,
-        max_value=MAX_LEN,
+    st.number_input(
+        "No. of Words",
+        min_value=MIN_WORDS,
+        max_value=MAX_WORDS,
         step=1,
-        key="max_len_input",
+        key="max_words_input",
         on_change=_update_from_input,
     )
 
-# Use this in your app
-max_output_length = st.session_state.max_len
+# Convert word count to approximate character count for the pipeline (avg ~5 chars/word)
+max_output_length = st.session_state.max_words * 5
 
 # Extract text from uploaded files as attachments
 attachment_contents = []
@@ -717,7 +711,7 @@ st.write(":blue[**Select Editorial Style Guides:**]")
 
 # Tooltip for guideline summary in the UI
 def render_guideline_checkbox(section_name: str, content: str, col_key_prefix: str):
-    default_checked = section_name in ["COMMON GRAMMATICAL ERRORS", "WRITING LETTERS"]
+    default_checked = True
     tooltip = guidelines_summary.get(section_name, None)  # one-sentence summary for hover
     if st.checkbox(
         section_name,
@@ -840,18 +834,37 @@ def make_pdf_bytes(text: str, title: str | None = None) -> bytes:
     return buf.getvalue()
 
 
+# --- Pipeline Stage Selection ---
+or_header("Pipeline Stage Configuration")
+
+st.markdown(":blue[**Select which pipeline stages to run:**]")
+st.caption("Stages 1–3 are required for any output. Stages 4–7 are optional post-processing stages.")
+
+with st.container(border=True):
+    col_core, col_optional = st.columns(2)
+    with col_core:
+        st.markdown("**Core Stages (always enabled)**")
+        st.checkbox("Stage 1: Iterative Refinement", value=True, disabled=True, key="stage_toggle_1")
+        st.checkbox("Stage 2: Retrieving Writing Style", value=True, disabled=True, key="stage_toggle_2")
+        st.checkbox("Stage 3: Generating Styled Output", value=True, disabled=True, key="stage_toggle_3")
+        st.checkbox("Stage 5: Convert to APA Format", value=True, disabled=True, key="stage_toggle_5")
+    with col_optional:
+        st.markdown("**Optional Stages**")
+        st.checkbox("Stage 4: Verify Citations", value=True, key="stage_toggle_4",
+                    help="Verify that citations in the styled output are supported by evidence")
+        st.checkbox("Stage 6: Plagiarism Detection", value=True, key="stage_toggle_6",
+                    help="Check the output for potential plagiarism against online sources")
+        st.checkbox("Stage 7: BSP Policy Alignment", value=True, key="stage_toggle_7",
+                    help="Verify alignment with BSP communication policies")
+
+
 if st.button(
     ":blue[**Generate Speech with Complete Pipeline**]",
     key="generate_speech",
     disabled=(
         not st.session_state.get("research_query", "").strip()
-        or (
-            not st.session_state.get("research_topics", "").strip()
-            and (not st.session_state.source_links or all(not link.strip() for link in st.session_state.source_links))
-            and not attachment_contents
-        )
     ),
-    help="Requires: Research Query plus at least one source (Topics/Keywords, Source Link, or Attachment)"
+    help="Requires: Research Query / Speech Topic"
 ):
     # Import complete pipeline
     import asyncio
@@ -873,7 +886,7 @@ if st.button(
         attachments = attachment_contents
         
         sources = {
-            "topics": user_topics,
+            "topics": user_topics if user_topics.strip() else user_query,
             "links": source_links,
             "attachments": attachments
         }
@@ -906,10 +919,16 @@ if st.button(
             7: "BSP Policy Alignment Check"
         }
 
+        # Determine enabled stages from user toggles
+        enabled_stages = set()
+        for i in range(1, 8):
+            if i <= 3 or i == 5 or st.session_state.get(f"stage_toggle_{i}", True):
+                enabled_stages.add(i)
+
         stage_store = {
             i: {
-                "status": "pending",
-                "lines": [],
+                "status": "pending" if i in enabled_stages else "skipped",
+                "lines": [] if i in enabled_stages else ["Skipped by user"],
                 "metrics": {},
                 "style_preview": "",
                 "initial_output_preview": "",
@@ -929,15 +948,47 @@ if st.button(
                 "running": "🔄",
                 "complete": "✅",
                 "error": "❌",
+                "skipped": "⏭️",
             }
             icon = icon_map.get(state["status"], "⏳")
-            suffix = " - Complete" if state["status"] == "complete" else ""
+            suffix_map = {
+                "complete": " - Complete",
+                "skipped": " - Skipped",
+                "error": " - Error",
+            }
+            suffix = suffix_map.get(state["status"], "")
 
             with stage_placeholders[stage_num].container(border=True):
                 st.markdown(f"### {icon} Stage {stage_num}: {stage_names[stage_num]}{suffix}")
+
+                # Per-stage progress bar
+                stage_progress_pct = {
+                    "pending": 0,
+                    "running": 50,
+                    "complete": 100,
+                    "error": 100,
+                    "skipped": 100,
+                }.get(state["status"], 0)
+
+                bar_color = {
+                    "pending": "#6c757d",
+                    "running": "#0d6efd",
+                    "complete": "#198754",
+                    "error": "#dc3545",
+                    "skipped": "#adb5bd",
+                }.get(state["status"], "#6c757d")
+
+                st.markdown(
+                    f'<div style="width:100%;background:#e9ecef;border-radius:6px;height:8px;margin:4px 0 8px;">'
+                    f'<div style="width:{stage_progress_pct}%;background:{bar_color};border-radius:6px;'
+                    f'height:8px;transition:width .4s ease;"></div></div>',
+                    unsafe_allow_html=True,
+                )
+
                 st.caption(
                     "Running live" if state["status"] == "running"
                     else "Completed" if state["status"] == "complete"
+                    else "Skipped" if state["status"] == "skipped"
                     else "Waiting" if state["status"] == "pending"
                     else "Needs attention"
                 )
@@ -968,8 +1019,9 @@ if st.button(
                 render_stage(i)
 
         # Iterations are now selected automatically inside the writer pipeline
-        selected_max_output_length = int(st.session_state.get("max_len", 6000))
-        selected_max_output_length = max(200, min(75000, selected_max_output_length))
+        selected_max_words = int(st.session_state.get("max_words", 1000))
+        selected_max_words = max(MIN_WORDS, min(MAX_WORDS, selected_max_words))
+        selected_max_output_length = selected_max_words * 5  # convert words to approx characters
         stage_store[1]["lines"].append("Configured iterations: auto (writer-selected)")
 
         def worker():
@@ -1159,7 +1211,8 @@ if st.button(
                         max_output_length=selected_max_output_length,
                         context_details=context_details,
                         style=selected_style if selected_style else None,
-                        enable_policy_check=True,
+                        enable_policy_check=7 in enabled_stages,
+                        enabled_stages=enabled_stages,
                         progress_callback=lambda event: event_queue.put(event),
                     )
                 )
@@ -1179,8 +1232,30 @@ if st.button(
                 })
 
         st.markdown("### 🔄 Writer Pipeline Running...")
+
+        # Overall progress bar
+        total_enabled = len(enabled_stages)
+        overall_progress_placeholder = st.empty()
+
+        def render_overall_progress():
+            completed_count = sum(
+                1 for i in range(1, 8)
+                if stage_store[i]["status"] in ("complete", "skipped")
+            )
+            pct = int((completed_count / 7) * 100)
+            bar_color = "#198754" if pct == 100 else "#0d6efd"
+            overall_progress_placeholder.markdown(
+                f'**Overall Pipeline Progress: {completed_count}/{total_enabled} stages**'
+                f'<div style="width:100%;background:#e9ecef;border-radius:8px;height:22px;margin:6px 0 12px;">'
+                f'<div style="width:{pct}%;background:{bar_color};border-radius:8px;height:22px;'
+                f'display:flex;align-items:center;justify-content:center;color:white;font-weight:600;'
+                f'font-size:12px;transition:width .4s ease;">{pct}%</div></div>',
+                unsafe_allow_html=True,
+            )
+
         st.markdown("---")
         render_all_stages()
+        render_overall_progress()
 
         pipeline_thread = threading.Thread(target=worker, daemon=True)
         pipeline_thread.start()
@@ -1194,11 +1269,11 @@ if st.button(
 
                 if event_type == "stage_started":
                     stage = event.get("stage")
-                    if stage in stage_store:
+                    if stage in stage_store and stage in enabled_stages:
                         stage_store[stage]["status"] = "running"
                 elif event_type == "stage_done":
                     stage = event.get("stage")
-                    if stage in stage_store:
+                    if stage in stage_store and stage_store[stage]["status"] != "skipped":
                         stage_store[stage]["status"] = "complete"
                 elif event_type == "stage_text":
                     stage = event.get("stage")
@@ -1222,7 +1297,7 @@ if st.button(
                     results = event.get("results") or {}
                     result_holder["results"] = results
                     for i in range(1, 8):
-                        if stage_store[i]["status"] != "error":
+                        if stage_store[i]["status"] not in ("error", "skipped"):
                             stage_store[i]["status"] = "complete"
 
                     style_used = results.get("style_used", {}) if isinstance(results, dict) else {}
@@ -1277,10 +1352,12 @@ if st.button(
 
             if updated:
                 render_all_stages()
+                render_overall_progress()
 
             time.sleep(0.15)
 
         render_all_stages()
+        render_overall_progress()
 
         if result_holder["error"]:
             st.error(f"Pipeline failed: {result_holder['error']}")
@@ -1322,7 +1399,28 @@ if st.button(
                 height=420,
                 key="final_output_display",
             )
+        else:
+            # Show detailed error info when no output is produced
+            error_details = []
+            if isinstance(styled_result, dict) and styled_result.get("error"):
+                error_details.append(f"**Style generation:** {styled_result['error']}")
+            if isinstance(final_summary, dict) and final_summary.get("error"):
+                error_details.append(f"**Summary generation:** {final_summary['error']}")
+            if error_details:
+                st.error("The pipeline did not produce output. Details below:")
+                for detail in error_details:
+                    st.markdown(detail)
+                logger.error(
+                    "Pipeline produced no output for query '%s'. Errors: %s",
+                    user_query[:120] if user_query else "(empty)",
+                    " | ".join(error_details),
+                )
+            else:
+                st.warning("No final output text was produced by the pipeline.")
+                logger.warning("Pipeline produced no output and no error details for query '%s'",
+                               user_query[:120] if user_query else "(empty)")
 
+        if final_output_text:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             speaker = st.session_state.get("selected_speaker_input", "Speaker")
             base_name = f"speech_{speaker}_{ts}"
@@ -1351,8 +1449,6 @@ if st.button(
 
             # Save style writer output to Cosmos DB
             utils.save_style_writer_output(final_output_text, user_query)
-        else:
-            st.warning("No final output text was produced by the pipeline.")
 
         st.stop()
         
@@ -1714,7 +1810,8 @@ if st.button(
                     max_iterations=None,
                     context_details=context_details,
                     style=selected_style if selected_style else None,
-                    enable_policy_check=True
+                    enable_policy_check=7 in enabled_stages,
+                    enabled_stages=enabled_stages,
                 )
             )
             
