@@ -4,6 +4,8 @@ import time
 import asyncio
 import re
 import copy
+import logging
+import traceback as _traceback_mod
 import requests
 import pandas as pd
 import streamlit as st
@@ -18,6 +20,8 @@ from pathlib import Path
 
 # Load environment variables
 load_dotenv()
+
+logger = logging.getLogger("pluma.writer_main")
 
 # Import deep_research components
 import sys
@@ -707,6 +711,7 @@ async def generate_summary_from_evidence(query: str, evidence_store: List[Dict[s
         Dictionary with summary, citations metadata, and validation results
     """
     if not evidence_store or len(evidence_store) == 0:
+        logger.warning("generate_summary_from_evidence called with empty evidence store for query '%s'", query[:120])
         return {
             "success": False,
             "summary": "",
@@ -1262,6 +1267,10 @@ Return ONLY the JSON array, no other text."""
         return result_payload
     
     except Exception as e:
+        logger.error(
+            "topic_processing failed for topic '%s', query '%s': %s",
+            topic[:80], query[:80], e, exc_info=True,
+        )
         return {
             "success": False,
             "topic": topic,
@@ -1932,6 +1941,19 @@ async def process_user_input(
     """
     # Split sources
     split_data = split_sources(sources)
+
+    # Fallback: if no sources at all, use the query itself as the topic for deep research
+    has_any_source = (
+        bool((split_data.get("topics") or "").strip())
+        or bool(split_data.get("links"))
+        or bool(split_data.get("attachments"))
+    )
+    if not has_any_source and query and query.strip():
+        logger.info(
+            "No sources provided; using query as topic for deep research: '%s'",
+            query[:120],
+        )
+        split_data["topics"] = query.strip()
     
     results = {
         "query": query,
@@ -2071,10 +2093,27 @@ async def process_user_input(
         summary_result = await generate_summary_from_evidence(query, results["evidence_store"])
         results["generated_summary"] = summary_result
     else:
+        # Log detailed diagnostics so we know WHY no evidence was collected
+        topic_err = (results.get("topic_results") or {}).get("error", "")
+        link_err = (results.get("link_results") or {}).get("error", "")
+        attach_err = (results.get("attachment_results") or {}).get("error", "")
+        logger.warning(
+            "No evidence collected for query '%s'. "
+            "topic_error=%s | link_error=%s | attachment_error=%s",
+            query[:120],
+            topic_err or "(none)",
+            link_err or "(none)",
+            attach_err or "(none)",
+        )
         results["generated_summary"] = {
             "success": False,
             "summary": "",
-            "error": "No evidence collected to generate summary",
+            "error": (
+                "No evidence collected to generate summary. "
+                f"Topic: {topic_err or 'no topic provided'}. "
+                f"Links: {link_err or 'no links provided'}. "
+                f"Attachments: {attach_err or 'no attachments provided'}."
+            ),
             "evidence_count": 0
         }
     
@@ -2105,6 +2144,42 @@ async def process_with_iterative_refinement(
                 progress_callback({"type": event_type, **payload})
             except Exception:
                 pass
+
+    try:
+        return await _process_with_iterative_refinement_inner(
+            query, sources, max_iterations, emit, iteration_prefix,
+        )
+    except Exception as e:
+        logger.error(
+            "process_with_iterative_refinement failed for query '%s': %s",
+            query[:120], e, exc_info=True,
+        )
+        emit("stage_text", stage=1, text=f"Iterative refinement error: {e}")
+        return {
+            "original_query": query,
+            "sources": sources,
+            "total_iterations": 0,
+            "max_iterations_requested": max_iterations,
+            "iterations": [],
+            "final_summary": {
+                "success": False,
+                "summary": "",
+                "error": f"Iterative refinement failed: {e}",
+                "evidence_count": 0,
+            },
+            "final_evidence_count": 0,
+            "cumulative_evidence_store": [],
+        }
+
+
+async def _process_with_iterative_refinement_inner(
+    query: str,
+    sources: Dict[str, Any],
+    max_iterations: int,
+    emit: Callable,
+    iteration_prefix: str,
+) -> Dict[str, Any]:
+    """Inner implementation of iterative refinement (extracted for try/except wrapper)."""
 
     iterations = []
     current_query = query
@@ -3333,7 +3408,7 @@ JSON:"""
         # User prompt with citation examples
         user_prompt = f"""Original Query: {query}
 
-    Setting / Location / Conference / Partners (optional context):
+    Additional Prompt Instructions (optional context):
     {context_details.strip() if context_details and context_details.strip() else "Not provided"}
 
 Research Summary to Rewrite:
@@ -3538,9 +3613,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
         return result
         
     except Exception as e:
-        print(f"[ERROR] Style generation failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        logger.error("Style generation failed for query '%s': %s", query[:120], e, exc_info=True)
         return {
             "success": False,
             "error": str(e),
@@ -4203,6 +4276,7 @@ async def process_with_iterative_refinement_and_style(
     enable_policy_check: bool = True,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     operating_mode: Optional[str] = None,
+    enabled_stages: Optional[set] = None,
 ) -> Dict[str, Any]:
     """
     Complete pipeline: Iterative refinement + Style-based output generation + Policy check.
@@ -4215,10 +4289,14 @@ async def process_with_iterative_refinement_and_style(
         context_details: Optional event/location/partner context
         style: Writing style dictionary (if None, will fetch random from DB)
         enable_policy_check: Whether to run BSP policy alignment check (default: True)
+        enabled_stages: Set of stage numbers (1-7) to run. None means all enabled.
     
     Returns:
         Complete results including refined summary, styled output, and policy check
     """
+    if enabled_stages is None:
+        enabled_stages = {1, 2, 3, 4, 5, 6, 7}
+
     pipeline_started_at = time.perf_counter()
     stage_elapsed_seconds: Dict[str, float] = {}
     stage_token_usage: Dict[str, Dict[str, int]] = {}
@@ -4336,6 +4414,100 @@ async def process_with_iterative_refinement_and_style(
         emit("stage_text", stage=1, text=f"Configured iterations: {max_iterations}")
 
     # Step 1: Iterative refinement
+    try:
+        return await _run_pipeline_stages(
+            query=query,
+            sources=sources,
+            max_iterations=max_iterations,
+            max_output_length=max_output_length,
+            context_details=context_details,
+            style=style,
+            enable_policy_check=enable_policy_check,
+            enabled_stages=enabled_stages,
+            fast_mode_enabled=fast_mode_enabled,
+            fast_deep_loops=fast_deep_loops,
+            standard_deep_loops=standard_deep_loops,
+            progress_callback=progress_callback,
+            emit=emit,
+            pipeline_started_at=pipeline_started_at,
+            stage_elapsed_seconds=stage_elapsed_seconds,
+            stage_token_usage=stage_token_usage,
+            _record_stage_elapsed=_record_stage_elapsed,
+            _merge_stage_token_usage=_merge_stage_token_usage,
+            _print_performance_telemetry=_print_performance_telemetry,
+            _parse_percent_value=_parse_percent_value,
+            _parse_int_env=_parse_int_env,
+        )
+    except Exception as e:
+        logger.error(
+            "Pipeline failed with unhandled error for query '%s': %s",
+            query[:120], e, exc_info=True,
+        )
+        emit("stage_text", stage=1, text=f"Pipeline error: {e}")
+        try:
+            _print_performance_telemetry()
+        except Exception:
+            pass
+        return {
+            "original_query": query,
+            "sources": sources,
+            "total_iterations": 0,
+            "iterations": [],
+            "final_summary": {"success": False, "summary": "", "error": str(e)},
+            "final_evidence_count": 0,
+            "cumulative_evidence_store": [],
+            "styled_output": {
+                "success": False,
+                "styled_output": "",
+                "error": (
+                    f"The pipeline encountered an unexpected error: {e}. "
+                    f"Please check the logs for details and try again."
+                ),
+            },
+            "styled_output_apa": None,
+            "citation_verification": None,
+            "plagiarism_analysis": None,
+            "policy_check": None,
+            "style_recoat": {"success": False, "applied": False, "output": "", "fallback_reason": "pipeline_error"},
+            "style_used": {
+                "name": style.get("name", "None") if style else "None",
+                "speaker": style.get("speaker", "None") if style else "None",
+                "audience": style.get("audience_setting_classification", "None") if style else "None",
+            },
+            "performance_telemetry": {
+                "elapsed_seconds": stage_elapsed_seconds,
+                "token_usage": stage_token_usage,
+                "total_elapsed_seconds": time.perf_counter() - pipeline_started_at,
+            },
+        }
+
+
+async def _run_pipeline_stages(
+    *,
+    query: str,
+    sources: Dict[str, Any],
+    max_iterations: int,
+    max_output_length: int,
+    context_details: str,
+    style: Optional[Dict[str, Any]],
+    enable_policy_check: bool,
+    enabled_stages: set,
+    fast_mode_enabled: bool,
+    fast_deep_loops: int,
+    standard_deep_loops: int,
+    progress_callback: Optional[Callable],
+    emit: Callable,
+    pipeline_started_at: float,
+    stage_elapsed_seconds: Dict[str, float],
+    stage_token_usage: Dict[str, Dict[str, int]],
+    _record_stage_elapsed: Callable,
+    _merge_stage_token_usage: Callable,
+    _print_performance_telemetry: Callable,
+    _parse_percent_value: Callable,
+    _parse_int_env: Callable,
+) -> Dict[str, Any]:
+    """Inner pipeline stages, extracted for top-level error handling."""
+
     emit("stage_started", stage=1)
     stage1_started_at = time.perf_counter()
     print(f"\n{'='*70}")
@@ -4378,14 +4550,55 @@ async def process_with_iterative_refinement_and_style(
     final_summary = refinement_results["final_summary"].get("summary", "")
     
     if not final_summary:
-        _print_performance_telemetry()
-        return {
-            **refinement_results,
-            "styled_output": {
-                "success": False,
-                "error": "No final summary generated from iterative refinement"
+        # Attempt to build a minimal summary from raw evidence when the LLM summary is empty
+        cumulative_evidence_fallback = refinement_results.get("cumulative_evidence_store", [])
+        refinement_error = refinement_results.get("final_summary", {}).get("error", "unknown reason")
+        logger.warning(
+            "No final summary produced for query '%s' (evidence_count=%d, error=%s). "
+            "Attempting fallback output from raw evidence.",
+            query[:120],
+            len(cumulative_evidence_fallback),
+            refinement_error,
+        )
+        emit("stage_text", stage=1, text=f"No summary produced: {refinement_error}. Attempting fallback.")
+
+        if cumulative_evidence_fallback:
+            # Build a simple bullet list from evidence claims as the fallback summary
+            bullet_lines = []
+            for ev in cumulative_evidence_fallback[:20]:
+                claim = ev.get("claim", "").strip()
+                eid = ev.get("id", "")
+                if claim:
+                    bullet_lines.append(f"- {claim} [{eid}]")
+            final_summary = (
+                f"## Summary (auto-generated fallback)\n\n"
+                f"The pipeline could not produce a refined summary "
+                f"(reason: {refinement_error}). "
+                f"Below are the collected evidence claims:\n\n"
+                + "\n".join(bullet_lines)
+            )
+            logger.info("Fallback summary built from %d evidence items.", len(bullet_lines))
+        else:
+            # No evidence at all - return with a clear error but still provide a result dict
+            logger.error(
+                "Pipeline produced no evidence AND no summary for query '%s'. "
+                "Returning error result. Reason: %s",
+                query[:120],
+                refinement_error,
+            )
+            _print_performance_telemetry()
+            return {
+                **refinement_results,
+                "styled_output": {
+                    "success": False,
+                    "styled_output": "",
+                    "error": (
+                        f"No evidence or summary could be generated for this topic. "
+                        f"Reason: {refinement_error}. "
+                        f"Please try rephrasing your query or providing additional source links."
+                    ),
+                },
             }
-        }
     
     # Step 2: Get writing style
     emit("stage_started", stage=2)
@@ -4559,7 +4772,14 @@ async def process_with_iterative_refinement_and_style(
     
     # Step 4: Verify citations in styled output
     verification_result = None
-    if styled_result.get("success") and styled_result.get("styled_output"):
+    if 4 not in enabled_stages:
+        print(f"\n{'='*70}")
+        print("STEP 4: VERIFYING STYLED OUTPUT CITATIONS - SKIPPED (disabled by user)")
+        print('='*70)
+        emit("stage_started", stage=4)
+        emit("stage_text", stage=4, text="Skipped by user preference")
+        emit("stage_done", stage=4)
+    elif styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=4)
         stage4_started_at = time.perf_counter()
         print(f"\n{'='*70}")
@@ -4645,7 +4865,14 @@ async def process_with_iterative_refinement_and_style(
     
     # Step 5: Convert to APA format
     apa_result = None
-    if styled_result.get("success") and styled_result.get("styled_output"):
+    if 5 not in enabled_stages:
+        print(f"\n{'='*70}")
+        print("STEP 5: CONVERTING TO APA FORMAT - SKIPPED (disabled by user)")
+        print('='*70)
+        emit("stage_started", stage=5)
+        emit("stage_text", stage=5, text="Skipped by user preference")
+        emit("stage_done", stage=5)
+    elif styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=5)
         stage5_started_at = time.perf_counter()
         print(f"\n{'='*70}")
@@ -4680,7 +4907,14 @@ async def process_with_iterative_refinement_and_style(
     
     # Step 6: Plagiarism Detection
     plagiarism_result = None
-    if styled_result.get("success") and styled_result.get("styled_output"):
+    if 6 not in enabled_stages:
+        print(f"\n{'='*70}")
+        print("STEP 6: PLAGIARISM DETECTION - SKIPPED (disabled by user)")
+        print('='*70)
+        emit("stage_started", stage=6)
+        emit("stage_text", stage=6, text="Skipped by user preference")
+        emit("stage_done", stage=6)
+    elif styled_result.get("success") and styled_result.get("styled_output"):
         emit("stage_started", stage=6)
         stage6_started_at = time.perf_counter()
         print(f"\n{'='*70}")
@@ -4807,7 +5041,14 @@ async def process_with_iterative_refinement_and_style(
         "fallback_reason": "not_run",
         "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "api_calls": 0},
     }
-    if enable_policy_check and styled_result.get("success"):
+    if 7 not in enabled_stages:
+        print(f"\n{'='*70}")
+        print("STEP 7: BSP POLICY ALIGNMENT CHECK - SKIPPED (disabled by user)")
+        print('='*70)
+        emit("stage_started", stage=7)
+        emit("stage_text", stage=7, text="Skipped by user preference")
+        emit("stage_done", stage=7)
+    elif enable_policy_check and styled_result.get("success"):
         emit("stage_started", stage=7)
         stage7_started_at = time.perf_counter()
         print(f"\n{'='*70}")

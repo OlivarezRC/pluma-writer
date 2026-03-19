@@ -77,6 +77,7 @@ def show_sidebar():
         with st.container(border=True):
             st.page_link("app.py", label="Style Writer", icon="📝")
             st.page_link("pages/style_refiner.py", label="Style Refiner", icon="🔧")
+            st.page_link("pages/reader.py", label="Style Rules", icon="✏️")
             st.page_link("pages/outputs.py", label="Generated Outputs", icon="📰")
             st.page_link("pages/settings.py", label="Settings", icon="⚙️")
 

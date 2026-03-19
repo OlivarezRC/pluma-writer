@@ -68,63 +68,63 @@ with col1:
     )
 
     st.text_area(
-        ":blue[**Setting / Location / Conference / Partners (Optional):**]",
+        ":blue[**Additional Prompt Instructions:**]",
         st.session_state.get("context_details_refiner", ""),
         height=90,
-        help="Optional context to guide greetings and speech considerations.",
+        help="Optional additional instructions to guide the speech writing process.",
         key="context_details_refiner",
     )
 
-    MIN_LEN, MAX_LEN, DEFAULT_LEN = 20, 75_000, 1_000
+    MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 4, 15_000, 200
 
-    # One source of truth
-    st.session_state.setdefault("max_len_refiner", DEFAULT_LEN)
+    # One source of truth (word count)
+    st.session_state.setdefault("max_words_refiner", DEFAULT_WORDS)
     st.session_state.setdefault("last_updated_refiner", None)
 
     def _update_from_slider():
         st.session_state.last_updated_refiner = "slider"
-        st.session_state.max_len_refiner = st.session_state.max_len_slider_refiner
+        st.session_state.max_words_refiner = st.session_state.max_words_slider_refiner
 
     def _update_from_input():
         st.session_state.last_updated_refiner = "input"
-        v = st.session_state.max_len_input_refiner
+        v = st.session_state.max_words_input_refiner
         # Coerce + clamp
         try:
             v = int(v)
         except Exception:
-            v = MIN_LEN
-        st.session_state.max_len_refiner = max(MIN_LEN, min(MAX_LEN, v))
+            v = MIN_WORDS
+        st.session_state.max_words_refiner = max(MIN_WORDS, min(MAX_WORDS, v))
 
     # Keep both widgets synced to the source of truth (avoid ping-pong)
     if st.session_state.last_updated_refiner != "slider":
-        st.session_state["max_len_slider_refiner"] = st.session_state.max_len_refiner
+        st.session_state["max_words_slider_refiner"] = st.session_state.max_words_refiner
     if st.session_state.last_updated_refiner != "input":
-        st.session_state["max_len_input_refiner"] = st.session_state.max_len_refiner
+        st.session_state["max_words_input_refiner"] = st.session_state.max_words_refiner
 
     col_slider, col_input = st.columns([3, 1])
 
     with col_slider:
         st.slider(
-            ":blue[**Output Maximum Character Length (75,000 Maximum):**]",
-            min_value=MIN_LEN,
-            max_value=MAX_LEN,
-            key="max_len_slider_refiner",
+            f":blue[**Output Maximum Word Length ({MAX_WORDS:,} Maximum):**]",
+            min_value=MIN_WORDS,
+            max_value=MAX_WORDS,
+            key="max_words_slider_refiner",
             on_change=_update_from_slider,
             disabled=False,
         )
 
     with col_input:
-        st.number_input(   # use number_input for clean integer UX
-            "No. of Characters",
-            min_value=MIN_LEN,
-            max_value=MAX_LEN,
+        st.number_input(
+            "No. of Words",
+            min_value=MIN_WORDS,
+            max_value=MAX_WORDS,
             step=1,
-            key="max_len_input_refiner",
+            key="max_words_input_refiner",
             on_change=_update_from_input,
         )
 
-    # Use this in your app
-    max_output_length = st.session_state.max_len_refiner
+    # Convert word count to approximate character count for the pipeline (avg ~5 chars/word)
+    max_output_length = st.session_state.max_words_refiner * 5
 
 with col2:
     
@@ -573,7 +573,7 @@ st.write(":blue[**Select Editorial Style Guides:**]")
 
 # Tooltip for guideline summary in the UI
 def render_guideline_checkbox(section_name: str, content: str, col_key_prefix: str):
-    default_checked = section_name in ["COMMON GRAMMATICAL ERRORS", "WRITING LETTERS"]
+    default_checked = True
     tooltip = guidelines_summary.get(section_name, None)  # one-sentence summary for hover
     if st.checkbox(
         section_name,
