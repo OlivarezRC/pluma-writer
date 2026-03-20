@@ -53,7 +53,7 @@ st.header("🔧 Style Refiner")
 #     accept_multiple_files=True,
 #     help="Upload PDF, Word, or PowerPoint files"
 # )
-or_header("Input the Contents or Upload the File for BSP Style Writing")
+or_header("Input the Contents or Upload the File for BSP Style Refining")
 
 # --- two-column layout (Col 1 / Col 2) ---
 col1, col2 = st.columns([3, 2], gap="small")
@@ -75,7 +75,7 @@ with col1:
         key="context_details_refiner",
     )
 
-    MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 4, 15_000, 200
+    MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 4, 15_000, 500
 
     # One source of truth (word count)
     st.session_state.setdefault("max_words_refiner", DEFAULT_WORDS)
@@ -105,7 +105,7 @@ with col1:
 
     with col_slider:
         st.slider(
-            f":blue[**Output Maximum Word Length ({MAX_WORDS:,} Maximum):**]",
+            f":blue[**Target Word Count:**]",
             min_value=MIN_WORDS,
             max_value=MAX_WORDS,
             key="max_words_slider_refiner",
@@ -124,7 +124,7 @@ with col1:
         )
 
     # Convert word count to approximate character count for the pipeline (avg ~5 chars/word)
-    max_output_length = st.session_state.max_words_refiner * 5
+    target_output_length = st.session_state.max_words_refiner * 5
 
 with col2:
     
@@ -708,45 +708,72 @@ if st.button(
 ):
     with st.container(border=True):
         with st.spinner("Processing..."):
-            # --- NEW: show the result and download buttons ---
-            st.markdown("### ✨ Rewritten Output")
             context_details = st.session_state.get("context_details_refiner", "").strip()
             output = prompts.rewrite_content(
                 content_all,
-                max_output_length,
+                target_output_length,
                 False,
                 context_details,
             )
             utils.save_output(output, content_all)
-            utils.save_style_refiner_output(output, content_all)
 
-            # --- NEW: cache for later & build filenames ---
-            st.session_state["last_output_refiner"] = output
             ts = datetime.now().strftime("%Y%m%d-%H%M%S")
             style_id = (st.session_state.get("styleId") or "Style").replace(" ", "_")
             base_name = f"rewrite_{style_id}_{ts}"
-
-            # --- NEW: build bytes for DOCX and PDF ---
             title_text = f"Rewrite • {st.session_state.get('styleId') or 'Selected Style'}"
             docx_bytes = make_docx_bytes(output, title=title_text)
             pdf_bytes = make_pdf_bytes(output, title=title_text)
 
-           # st.text_area("Result", output, height=300)
+            # Upload to Azure Blob Storage
+            _pdf_url = utils.upload_bytes_to_blob(
+                pdf_bytes,
+                f"refiner/{base_name}.pdf",
+                content_type="application/pdf",
+            )
+            _docx_url = utils.upload_bytes_to_blob(
+                docx_bytes,
+                f"refiner/{base_name}.docx",
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "⬇️ Download as DOCX",
-                    data=docx_bytes,
-                    file_name=f"{base_name}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-            with c2:
-                st.download_button(
-                    "⬇️ Download as PDF",
-                    data=pdf_bytes,
-                    file_name=f"{base_name}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+            # Save to Cosmos DB with blob URLs
+            utils.save_style_refiner_output(
+                output, content_all,
+                pdf_url=_pdf_url, docx_url=_docx_url,
+            )
+
+            # Cache in session state for persistent display
+            st.session_state["refiner_output_cache"] = {
+                "text": output,
+                "docx_bytes": docx_bytes,
+                "pdf_bytes": pdf_bytes,
+                "base_name": base_name,
+            }
+            st.rerun()
+
+# --- Persistent output display (survives download-button reruns) ---
+if "refiner_output_cache" in st.session_state:
+    _rc = st.session_state["refiner_output_cache"]
+    with st.container(border=True):
+        st.markdown("### ✨ Rewritten Output")
+        st.text_area("Result", _rc["text"], height=420, key="refiner_output_display")
+
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            st.download_button(
+                "⬇️ Download as DOCX",
+                data=_rc["docx_bytes"],
+                file_name=f"{_rc['base_name']}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                key="dl_refiner_docx",
+            )
+        with _c2:
+            st.download_button(
+                "⬇️ Download as PDF",
+                data=_rc["pdf_bytes"],
+                file_name=f"{_rc['base_name']}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_refiner_pdf",
+            )
