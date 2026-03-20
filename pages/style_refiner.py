@@ -40,11 +40,11 @@ pages.show_home()
 pages.show_sidebar()
 
 # Home page
-st.header("🔧 Style Refiner")
+st.header("🔧 Speech Refiner")
 
 # # Content input
 # st.session_state.content = st.text_area(
-#     ":blue[**Content Input for BSP Writing Style:**]", st.session_state.content, 200
+#     ":blue[**Content Input for BSP Speech:**]", st.session_state.content, 200
 # )
 
 # uploaded_files = st.file_uploader(
@@ -53,7 +53,7 @@ st.header("🔧 Style Refiner")
 #     accept_multiple_files=True,
 #     help="Upload PDF, Word, or PowerPoint files"
 # )
-or_header("Input the Contents or Upload the File for BSP Style Refining")
+or_header("Input the Contents or Upload the File for BSP Speech Refining")
 
 # --- two-column layout (Col 1 / Col 2) ---
 col1, col2 = st.columns([3, 2], gap="small")
@@ -568,6 +568,7 @@ if show_loaded_rules:
 guidelines = st.session_state.locals.get("relevant_guidelines", {})
 guidelines_summary = st.session_state.locals.get("guideline_summaries", {}) 
 selected_guidelines = []
+selected_guideline_names = []
 
 st.write(":blue[**Select Editorial Style Guides:**]")
 
@@ -582,6 +583,7 @@ def render_guideline_checkbox(section_name: str, content: str, col_key_prefix: s
         help=tooltip  # <-- hover tooltip appears on the ⓘ icon and on hover
     ):
         selected_guidelines.append(content)
+        selected_guideline_names.append(section_name)
 
 # Create a checkbox for each guideline section
 if guidelines:
@@ -663,7 +665,7 @@ def make_pdf_bytes(text: str, title: str | None = None) -> bytes:
         topMargin=2 * cm,
         bottomMargin=2 * cm,
         title=title or "Rewrite",
-        author="Style Writer",
+        author="Speech Writer",
     )
 
     styles = getSampleStyleSheet()
@@ -740,6 +742,9 @@ if st.button(
             utils.save_style_refiner_output(
                 output, content_all,
                 pdf_url=_pdf_url, docx_url=_docx_url,
+                additional_instructions=context_details,
+                editorial_style_guides=selected_guideline_names,
+                target_word_count=st.session_state.get("max_words_refiner", 0),
             )
 
             # Cache in session state for persistent display
