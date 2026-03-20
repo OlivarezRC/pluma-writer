@@ -19,7 +19,7 @@ def show_home():
            use_container_width=True ,
         )
         st.markdown("### ✍️ Pluma")
-        st.caption("BSP Style Writer • Edit, format, and validate content against your style guide.")
+        st.caption("BSP Speech Writer & Refiner • Write and refine speeches against the governor style guide.")
         st.divider()
         # (Optional) 
         # st.session_state.current_view = st.radio(
@@ -75,9 +75,9 @@ def show_home():
 def show_sidebar():
     with st.sidebar:
         with st.container(border=True):
-            st.page_link("app.py", label="Style Writer", icon="📝")
-            st.page_link("pages/style_refiner.py", label="Style Refiner", icon="🔧")
-            st.page_link("pages/reader.py", label="Style Rules", icon="✏️")
+            st.page_link("app.py", label="Speech Writer", icon="📝")
+            st.page_link("pages/style_refiner.py", label="Speech Refiner", icon="🔧")
+            st.page_link("pages/reader.py", label="Speech Rules", icon="✏️")
             st.page_link("pages/outputs.py", label="Generated Outputs", icon="📰")
             st.page_link("pages/settings.py", label="Settings", icon="⚙️")
 
