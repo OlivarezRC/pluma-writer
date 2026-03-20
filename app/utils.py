@@ -358,7 +358,12 @@ def save_output(output, content_all):
         st.error(f"An error occurred while saving output: {e}")
 
 
-def save_style_writer_output(output, content, pdf_url="", docx_url=""):
+def save_style_writer_output(
+    output, content, pdf_url="", docx_url="",
+    keywords="", attachment_urls=None, source_links=None,
+    additional_instructions="", target_word_count=0,
+    editorial_style_guides=None, pipeline_stages=None,
+):
     try:
         headers = st.context.headers
         user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
@@ -375,13 +380,25 @@ def save_style_writer_output(output, content, pdf_url="", docx_url=""):
             "user_name": user_name,
             "pdf": pdf_url,
             "docx": docx_url,
+            "keywords": keywords,
+            "attachment_urls": attachment_urls or [],
+            "source_links": source_links or [],
+            "additional_instructions": additional_instructions,
+            "target_word_count": target_word_count,
+            "editorial_style_guides": editorial_style_guides or [],
+            "pipeline_stages": pipeline_stages or [],
+            "output_word_count": len(output.split()) if output else 0,
         }
         style_writer_output_container.create_item(body=new_output)
     except exceptions.CosmosHttpResponseError as e:
-        st.error(f"An error occurred while saving style writer output: {e}")
+        st.error(f"An error occurred while saving speech writer output: {e}")
 
 
-def save_style_refiner_output(output, content, pdf_url="", docx_url=""):
+def save_style_refiner_output(
+    output, content, pdf_url="", docx_url="",
+    additional_instructions="", editorial_style_guides=None,
+    target_word_count=0,
+):
     try:
         headers = st.context.headers
         user_id = headers.get('X-MS-CLIENT-PRINCIPAL-ID', '12345')
@@ -398,10 +415,14 @@ def save_style_refiner_output(output, content, pdf_url="", docx_url=""):
             "user_name": user_name,
             "pdf": pdf_url,
             "docx": docx_url,
+            "additional_instructions": additional_instructions,
+            "editorial_style_guides": editorial_style_guides or [],
+            "target_word_count": target_word_count,
+            "output_word_count": len(output.split()) if output else 0,
         }
         style_refiner_output_container.create_item(body=new_output)
     except exceptions.CosmosHttpResponseError as e:
-        st.error(f"An error occurred while saving style refiner output: {e}")
+        st.error(f"An error occurred while saving speech refiner output: {e}")
 
 
 # get outputs from database
@@ -485,8 +506,24 @@ def _get_outputs_from_container(container, display_columns=None):
 
 
 def get_style_writer_outputs():
-    return _get_outputs_from_container(style_writer_output_container)
+    return _get_outputs_from_container(
+        style_writer_output_container,
+        display_columns=[
+            'updatedAt', 'user_name', 'styleId', 'content',
+            'keywords', 'attachment_urls', 'source_links',
+            'additional_instructions', 'target_word_count',
+            'editorial_style_guides', 'pipeline_stages',
+            'output', 'output_word_count', 'pdf', 'docx',
+        ],
+    )
 
 
 def get_style_refiner_outputs():
-    return _get_outputs_from_container(style_refiner_output_container)
+    return _get_outputs_from_container(
+        style_refiner_output_container,
+        display_columns=[
+            'updatedAt', 'user_name', 'styleId', 'content',
+            'additional_instructions', 'editorial_style_guides',
+            'target_word_count', 'output', 'output_word_count', 'pdf', 'docx',
+        ],
+    )
