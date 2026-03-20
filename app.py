@@ -146,7 +146,7 @@ pages.show_home()
 pages.show_sidebar()
 
 # Home page
-st.header("📝Style Writer")
+st.header("📝Speech Writer")
 
 # # Content input
 # st.session_state.content = st.text_area(
@@ -159,7 +159,7 @@ st.header("📝Style Writer")
 #     accept_multiple_files=True,
 #     help="Upload PDF, Word, or PowerPoint files"
 # )
-or_header("Input Research Query and Sources for BSP Style Writing")
+or_header("Input Research Query and Sources for BSP Governor Speech Writing")
 
 # Research Query
 st.text_input(
@@ -706,6 +706,7 @@ if show_loaded_rules:
 guidelines = st.session_state.locals.get("relevant_guidelines", {})
 guidelines_summary = st.session_state.locals.get("guideline_summaries", {}) 
 selected_guidelines = []
+selected_guideline_names = []
 
 st.write(":blue[**Select Editorial Style Guides:**]")
 
@@ -720,6 +721,7 @@ def render_guideline_checkbox(section_name: str, content: str, col_key_prefix: s
         help=tooltip  # <-- hover tooltip appears on the ⓘ icon and on hover
     ):
         selected_guidelines.append(content)
+        selected_guideline_names.append(section_name)
 
 # Create a checkbox for each guideline section
 if guidelines:
@@ -801,7 +803,7 @@ def make_pdf_bytes(text: str, title: str | None = None) -> bytes:
         topMargin=2 * cm,
         bottomMargin=2 * cm,
         title=title or "Rewrite",
-        author="Style Writer",
+        author="Speech Writer",
     )
 
     styles = getSampleStyleSheet()
@@ -1471,10 +1473,33 @@ if st.button(
                 content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
-            # Save to Cosmos DB with blob URLs
+            # Upload attachment files to blob storage
+            _attachment_urls = []
+            for att in attachments:
+                if att.get("bytes"):
+                    _att_blob_name = f"attachments/{_base_name}/{att['filename']}"
+                    _att_url = utils.upload_bytes_to_blob(
+                        att["bytes"],
+                        _att_blob_name,
+                        content_type="application/octet-stream",
+                    )
+                    if _att_url:
+                        _attachment_urls.append(_att_url)
+
+            # Collect pipeline stage names that were enabled
+            _pipeline_stage_names = [stage_names[i] for i in sorted(enabled_stages)]
+
+            # Save to Cosmos DB with blob URLs and additional user inputs
             utils.save_style_writer_output(
                 final_output_text, user_query,
                 pdf_url=_pdf_url, docx_url=_docx_url,
+                keywords=user_topics,
+                attachment_urls=_attachment_urls,
+                source_links=source_links,
+                additional_instructions=context_details,
+                target_word_count=selected_max_words,
+                editorial_style_guides=selected_guideline_names,
+                pipeline_stages=_pipeline_stage_names,
             )
 
             # Cache in session state for persistent rendering across reruns
