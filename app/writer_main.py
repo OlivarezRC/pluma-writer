@@ -450,6 +450,15 @@ async def reapply_style_coat_strict(
         if example:
             system_parts.append(f"<writingExample>{example}</writingExample>\n")
 
+        # SPEAKER PERSPECTIVE: Preserve first-person voice
+        coat_speaker_name = style.get("speaker") or style.get("Speaker")
+        if coat_speaker_name:
+            system_parts.extend([
+                f"SPEAKER PERSPECTIVE: This speech is delivered by {coat_speaker_name}. "
+                "Maintain first-person perspective throughout ('I', 'we'). "
+                f"NEVER refer to {coat_speaker_name} in the third person.\n",
+            ])
+
         system_parts.extend([
             "CONTENT-LOCK RULES (MANDATORY):\n",
             "1. Keep the same factual meaning sentence-by-sentence.\n",
@@ -464,6 +473,7 @@ async def reapply_style_coat_strict(
             "10. Simplify jargon by rephrasing in common words, but do NOT change technical meaning.\n",
             "11. Keep tone formal, clear, and audience-friendly; do not sound like an academic abstract.\n",
             "12. If any requested style instruction conflicts with content lock, prioritize content lock.\n",
+            "13. Preserve first-person speaker perspective — do not switch to third person.\n",
             "Return ONLY the fully rewritten speech text, no explanations.\n",
         ])
 
@@ -2685,6 +2695,114 @@ def enforce_citation_discipline(text: str, max_ids_per_sentence: int = 2) -> str
     return ''.join(corrected_parts)
 
 
+def fix_speaker_perspective(text: str, speaker_name: str) -> str:
+    """
+    Post-process speech text to fix third-person references to the speaker.
+    
+    When the speaker is the one delivering the speech, references like
+    "Governor Remolona noted that..." should be converted to first-person.
+
+    Args:
+        text: The speech text to fix
+        speaker_name: The speaker's name (e.g., "Eli M. Remolona Jr.")
+
+    Returns:
+        Text with third-person speaker references corrected to first person.
+    """
+    if not text or not speaker_name:
+        return text
+
+    # Build name variants for matching:
+    # "Eli M. Remolona Jr." -> ["Remolona", "Eli M. Remolona Jr.", "Eli Remolona"]
+    name_parts = speaker_name.strip().split()
+    name_variants = {speaker_name.strip()}
+
+    # Add last name (skip suffixes like Jr., Sr., III)
+    suffixes = {"jr.", "jr", "sr.", "sr", "ii", "iii", "iv"}
+    substantive_parts = [p for p in name_parts if p.lower().rstrip(".,") not in suffixes]
+    if substantive_parts:
+        last_name = substantive_parts[-1].rstrip(".,")
+        name_variants.add(last_name)
+        # First + Last (no middle initial)
+        if len(substantive_parts) >= 2:
+            name_variants.add(f"{substantive_parts[0]} {last_name}")
+
+    # Common titles that may precede the speaker's name
+    titles = [
+        "Governor", "Deputy Governor", "Director", "Chairman",
+        "President", "Secretary", "Commissioner", "Dr.",
+        "Sec.", "Gov.", "Dir.", "Amb.", "Atty.",
+    ]
+
+    fixes_applied = 0
+
+    # Sort name variants longest first to avoid partial replacements
+    sorted_variants = sorted(name_variants, key=len, reverse=True)
+
+    for variant in sorted_variants:
+        escaped = re.escape(variant)
+
+        # Pattern: "Title Name said/stated/noted/emphasized/highlighted/mentioned/stressed/argued/explained..."
+        for title in titles:
+            t_escaped = re.escape(title)
+            # "Governor Remolona noted that X" -> "I note that X" (but only at sentence-level)
+            pattern = re.compile(
+                rf'\b{t_escaped}\s+{escaped}\b',
+                re.IGNORECASE
+            )
+            if pattern.search(text):
+                text = pattern.sub("I", text)
+                fixes_applied += 1
+
+        # Pattern: "According to Name, ..." -> "... " (remove the phrase)
+        pattern_according = re.compile(
+            rf'[Aa]ccording\s+to\s+{escaped}\s*,?\s*',
+            re.IGNORECASE
+        )
+        if pattern_according.search(text):
+            text = pattern_according.sub("", text)
+            fixes_applied += 1
+
+        # Pattern: "Name stated/said/noted/emphasized/believes/highlights that"
+        # -> "I state/say/note... that"
+        verbs_map = {
+            "stated": "stated", "states": "state", "said": "said",
+            "says": "say", "noted": "noted", "notes": "note",
+            "emphasized": "emphasized", "emphasizes": "emphasize",
+            "highlighted": "highlighted", "highlights": "highlight",
+            "believes": "believe", "believed": "believed",
+            "mentioned": "mentioned", "mentions": "mention",
+            "stressed": "stressed", "stresses": "stress",
+            "argued": "argued", "argues": "argue",
+            "explained": "explained", "explains": "explain",
+            "added": "added", "adds": "add",
+            "observed": "observed", "observes": "observe",
+            "pointed out": "pointed out", "points out": "point out",
+            "underscored": "underscored", "underscores": "underscore",
+            "reiterated": "reiterated", "reiterates": "reiterate",
+        }
+
+        for third_verb, first_verb in verbs_map.items():
+            pattern_name_verb = re.compile(
+                rf'\b{escaped}\s+{re.escape(third_verb)}\b',
+                re.IGNORECASE
+            )
+            if pattern_name_verb.search(text):
+                text = pattern_name_verb.sub(f"I {first_verb}", text)
+                fixes_applied += 1
+
+    # Fix double-capital "I" at sentence start after replacements (e.g., ". I I noted")
+    text = re.sub(r'\bI\s+I\b', 'I', text)
+
+    # Fix sentences starting with lowercase after our replacements
+    text = re.sub(r'(?<=\.\s)([a-z])', lambda m: m.group(1).upper(), text)
+
+    if fixes_applied > 0:
+        print(f"[INFO] Fixed {fixes_applied} third-person speaker reference(s) to first-person perspective")
+
+    return text
+
+
 def trim_text_to_boundary(text: str, max_length: int) -> str:
     """Trim text to max_length without cutting citations/sentences mid-way when possible."""
     if not text or len(text) <= max_length:
@@ -2839,11 +2957,20 @@ async def smart_trim_speech_to_max_length(
             style_context += "Retain rhetorical voice, cadence, confidence, and register.\n"
             style_context += "</STYLE_TO_RETAIN>\n"
 
+        # SPEAKER PERSPECTIVE: Preserve first-person voice during trimming
+        trim_speaker_name = style_profile.get("speaker") or style_profile.get("Speaker") if style_profile else None
+        perspective_note = ""
+        if trim_speaker_name:
+            perspective_note = (
+                f" This speech is delivered by {trim_speaker_name} — maintain first-person "
+                f"perspective ('I', 'we') and NEVER refer to {trim_speaker_name} in the third person."
+            )
+
         system_prompt = (
             "You are a senior speech editor. Shorten the speech by removing the least important "
             "details only. Preserve core message, factual meaning, argument flow, and speaker style. "
             "Do not add new claims, policies, or disclaimers. Keep all citations already present "
-            "in retained sentences unchanged."
+            "in retained sentences unchanged." + perspective_note
         )
 
         user_prompt = f"""{style_context}
@@ -2957,7 +3084,7 @@ async def fix_speech_issues(
             
             "plagiarism": """Rewrite text with high similarity to sources. Restructure sentences, use synonyms, change word order. Keep citations [ENN] intact. Preserve factual accuracy.""",
             
-            "policy": """Fix concrete BSP policy violations with targeted edits only. Do not add blanket disclaimer sections or legal boilerplate unless explicitly required by a listed issue. Preserve confidence, directness, and the speaker's rhetorical style; only soften language when a specific statement is unsupported, non-compliant, or misleading. Use "BSP/we" not "I". Keep citations [ENN] intact. Maintain professional tone.""",
+            "policy": """Fix concrete BSP policy violations with targeted edits only. Do not add blanket disclaimer sections or legal boilerplate unless explicitly required by a listed issue. Preserve confidence, directness, and the speaker's rhetorical style; only soften language when a specific statement is unsupported, non-compliant, or misleading. This is a speech delivered by the speaker — preserve first-person voice ("I", "we") and do NOT convert to third person. Keep citations [ENN] intact. Maintain professional tone.""",
             
             "generic": """Fix flagged issues. Preserve citations [ENN], maintain voice and facts."""
         }
@@ -3036,6 +3163,12 @@ TASK: Revise the speech to fix the {len(issues)} issue(s) listed above. Return O
         
         fixed_speech = response.choices[0].message.content.strip()
         
+        # Fix speaker perspective if style profile has a speaker
+        if style_profile:
+            fix_speaker = style_profile.get("speaker") or style_profile.get("Speaker")
+            if fix_speaker:
+                fixed_speech = fix_speaker_perspective(fixed_speech, fix_speaker)
+        
         # Analyze what changed
         fix_details = []
         if fixed_speech != speech_text:
@@ -3080,7 +3213,7 @@ async def generate_styled_output(
     style: Dict[str, Any], 
     context_details: str = "",
     evidence_store: List[Dict[str, Any]] = None, 
-    max_output_length: int = 16000,
+    max_output_length: int = 5000,
     use_claim_outline: bool = True  # IMPROVEMENT #1: Use claim outlines by default
 ) -> Dict[str, Any]:
     """
@@ -3093,7 +3226,7 @@ async def generate_styled_output(
         style: Writing style dictionary from Cosmos DB (can be None for default formatting)
         context_details: Optional event/setting/partner context provided by user
         evidence_store: List of atomic evidence items for citation validation
-        max_output_length: Maximum completion tokens for output (default: 16000 for GPT-5 reasoning)
+        max_output_length: Target output length in characters (default: 5000 ≈ 1000 words at ~5 chars/word). Output will be trimmed if it exceeds this by more than 10%.
         use_claim_outline: If True, generate claim outline first to prevent style drift
     
     Returns:
@@ -3376,7 +3509,20 @@ JSON:"""
                 print(f"[WARNING] No speech examples found for {speaker_name}, using style description only")
         
         system_parts.append("Make sure to emulate the writing style, global rules, guidelines and examples provided above.\n\n")
-        
+
+        # SPEAKER PERSPECTIVE: Write as the speaker, not about them
+        speaker_name = style.get("speaker") or style.get("Speaker")
+        if speaker_name:
+            system_parts.extend([
+                "SPEAKER PERSPECTIVE (MANDATORY):\n",
+                f"You are writing a speech to be delivered by {speaker_name}.\n",
+                "The speech must be written from the speaker's OWN perspective (first person).\n",
+                f"- Use 'I' and 'we' — NEVER refer to {speaker_name} in the third person.\n",
+                f"- WRONG: '{speaker_name} believes that...', 'The Governor noted...', 'According to {speaker_name}...'\n",
+                "- RIGHT: 'I believe that...', 'We at the BSP...', 'Let me share...'\n",
+                "- The speaker is addressing the audience directly; write as if they are speaking.\n\n",
+            ])
+
         # Add claim outline instructions if available
         if claim_outline and claim_outline_data:
             system_parts.extend([
@@ -3400,7 +3546,9 @@ JSON:"""
             "6. Multiple claims in one sentence = multiple citations [E1,E3,E7]\n",
             "7. End with a short closing reflection (1-3 sentences) on why this topic matters to BSP, financial institutions, and the nation as a whole. Keep this aligned with available evidence and avoid unsupported claims.\n",
             "8. Finish with a clear closing greeting line (e.g., 'Thank you.' or 'Maraming salamat po.').\n\n",
-            f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
+            f"TARGET OUTPUT LENGTH: {max_output_length} characters — approximately {max_output_length // 5} words (excluding references). "
+            f"This is a STRICT target: the final speech body MUST be within ±10-15% of {max_output_length // 5} words. "
+            f"That means between {int((max_output_length // 5) * 0.85)} and {int((max_output_length // 5) * 1.15)} words. Do NOT produce output significantly outside this range."
         ])
         
         system_prompt = "".join(system_parts)
@@ -3428,7 +3576,7 @@ Example correct format:
 Now rewrite the summary in the specified style with ALL citations preserved:"""
 
         # Keep completion token budget separate from output character cap.
-        # max_output_length limits final characters (enforced after generation),
+        # max_output_length sets the indicative target for final characters,
         # while completion tokens must leave room for GPT-5 reasoning + visible output.
         # These can be tuned via environment variables if needed.
         try:
@@ -3527,13 +3675,18 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "token_usage": token_usage_summary,
             }
         
-        # If over max length, prioritize smart LLM trimming before hard truncation.
-        # Character limit applies to speech body only (references excluded).
+        # Enforce strict target word count: trim if the output overshoots by more than 15%.
         body_text, references_section = split_references_section(styled_output)
         body_length = len(body_text)
         effective_body_length = len(strip_in_text_citations(body_text))
-        if effective_body_length > max_output_length:
-            print(f"[INFO] Output body exceeds max length ({body_length} raw chars, {effective_body_length} effective chars > {max_output_length}). Running smart trim fixer...")
+        upper_tolerance = int(max_output_length * 1.15)  # allow up to 15% over
+        lower_bound = int(max_output_length * 0.85)  # flag if under 15%
+        target_words = max_output_length // 5
+        effective_words = len(strip_in_text_citations(body_text).split())
+        print(f"[INFO] Word count check: {effective_words} words (target: {target_words}, range: {int(target_words * 0.85)}-{int(target_words * 1.15)})")
+        if effective_body_length > upper_tolerance:
+            pct_over = ((effective_body_length - max_output_length) / max_output_length) * 100
+            print(f"[INFO] Output body exceeds target by {pct_over:.0f}% ({body_length} raw chars, {effective_body_length} effective chars vs {max_output_length} target). Running smart trim...")
             trim_result = await smart_trim_speech_to_max_length(
                 speech_text=styled_output,
                 max_length=max_output_length,
@@ -3549,16 +3702,24 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 styled_output = trim_body_preserve_closing(body_text, max_output_length) + references_section
 
             body_after_trim, refs_after_trim = split_references_section(styled_output)
-            if len(strip_in_text_citations(body_after_trim)) > max_output_length:
+            if len(strip_in_text_citations(body_after_trim)) > upper_tolerance:
                 body_after_trim = trim_body_preserve_closing(body_after_trim, max_output_length)
                 styled_output = body_after_trim + refs_after_trim
 
             body_final, refs_final = split_references_section(styled_output)
-            print(f"[INFO] Final output length after trim enforcement (body={len(body_final)} raw chars, effective={len(strip_in_text_citations(body_final))} chars, refs={len(refs_final)} chars)")
+            print(f"[INFO] Final output length after trim (body={len(body_final)} raw chars, effective={len(strip_in_text_citations(body_final))} chars, refs={len(refs_final)} chars)")
+        else:
+            print(f"[INFO] Output body within target range ({effective_body_length} effective chars vs {max_output_length} target).")
         
         # IMPROVEMENT #5: Enforce citation discipline (max 2 IDs per sentence)
         print("[INFO] Enforcing citation discipline (max 2 IDs/sentence)...")
         styled_output = enforce_citation_discipline(styled_output, max_ids_per_sentence=2)
+        
+        # IMPROVEMENT: Fix speaker perspective (third-person -> first-person)
+        perspective_speaker = style.get("speaker") or style.get("Speaker")
+        if perspective_speaker:
+            print(f"[INFO] Checking speaker perspective for {perspective_speaker}...")
+            styled_output = fix_speaker_perspective(styled_output, perspective_speaker)
         
         # Validate citations in styled output
         citation_pattern = r'\[E\d+(?:,E\d+)*\]'
@@ -3592,7 +3753,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
             "output_length": len(strip_in_text_citations(output_body)) if output_body else 0,
             "output_length_raw": len(output_body) if output_body else 0,
             "references_length": len(output_refs) if output_refs else 0,
-            "max_length": max_output_length,
+            "target_length": max_output_length,
             "citations_found": len(citations_found),
             "unique_evidence_cited": cited_count,
             "citation_coverage": f"{coverage:.1f}%",
@@ -4270,7 +4431,7 @@ async def process_with_iterative_refinement_and_style(
     query: str,
     sources: Dict[str, Any],
     max_iterations: Optional[int] = None,
-    max_output_length: int = 16000,
+    target_output_length: int = 5000,
     context_details: str = "",
     style: Optional[Dict[str, Any]] = None,
     enable_policy_check: bool = True,
@@ -4285,7 +4446,7 @@ async def process_with_iterative_refinement_and_style(
         query: User's research query
         sources: Sources dictionary (topics, links, attachments)
         max_iterations: Number of refinement iterations
-        max_output_length: Maximum styled output character length
+        target_output_length: Target output length in characters (default: 5000 ≈ 1000 words). Converted from word count at the UI layer (words × 5).
         context_details: Optional event/location/partner context
         style: Writing style dictionary (if None, will fetch random from DB)
         enable_policy_check: Whether to run BSP policy alignment check (default: True)
@@ -4419,7 +4580,7 @@ async def process_with_iterative_refinement_and_style(
             query=query,
             sources=sources,
             max_iterations=max_iterations,
-            max_output_length=max_output_length,
+            target_output_length=target_output_length,
             context_details=context_details,
             style=style,
             enable_policy_check=enable_policy_check,
@@ -4487,7 +4648,7 @@ async def _run_pipeline_stages(
     query: str,
     sources: Dict[str, Any],
     max_iterations: int,
-    max_output_length: int,
+    target_output_length: int,
     context_details: str,
     style: Optional[Dict[str, Any]],
     enable_policy_check: bool,
@@ -4645,7 +4806,7 @@ async def _run_pipeline_stages(
         query, 
         style,
         context_details=context_details,
-        max_output_length=max_output_length,
+        max_output_length=target_output_length,
         evidence_store=generation_evidence,
         use_claim_outline=True  # IMPROVEMENT #1: Explicitly enable claim-based styling
     )
@@ -4668,7 +4829,7 @@ async def _run_pipeline_stages(
                 print(f"  ✓ All citations valid")
         emit("stage_text", stage=3, text="Styled output generated successfully")
         emit("stage_metric", stage=3, key="Output Length", value=len(styled_result.get("styled_output", "")))
-        emit("stage_metric", stage=3, key="Max Length", value=max_output_length)
+        emit("stage_metric", stage=3, key="Target Length", value=target_output_length)
         emit("stage_metric", stage=3, key="Citations", value=styled_result.get("citations_found", 0))
         emit("stage_metric", stage=3, key="Evidence IDs", value=styled_result.get("unique_evidence_cited", 0))
     else:
@@ -4756,7 +4917,7 @@ async def _run_pipeline_stages(
                     query,
                     style,
                     context_details=context_details,
-                    max_output_length=max_output_length,
+                    max_output_length=target_output_length,
                     evidence_store=generation_evidence,
                     use_claim_outline=True,
                 )

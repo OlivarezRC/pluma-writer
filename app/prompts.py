@@ -53,6 +53,9 @@ def extract_style(combined_text, debug):
 def rewrite_content(content_all, max_output_length, debug, context_details=""):
     digest = _get_style_digest()
 
+    # Detect speaker from session state for perspective enforcement
+    speaker_name = st.session_state.get("speaker_refiner") or ""
+
     system = [
         "You are an expert writer assistant. Rewrite the user input based on the following writing style, global rules, writing guidelines and writing example.\n",
         f"<writingStyle>{digest.get('style', '')}</writingStyle>\n",
@@ -60,8 +63,20 @@ def rewrite_content(content_all, max_output_length, debug, context_details=""):
         f"<writingGuidelines>{digest.get('guidelines', '')}</writingGuidelines>\n",
         f"<writingExample>{digest.get('example', '')}</writingExample>\n",
         "Make sure to emulate the writing style, global rules, guidelines and example provided above.",
-        f"YOU CAN ONLY OUTPUT A MAXIMUM OF {max_output_length} CHARACTERS"
+        f"TARGET WORD COUNT: Your output MUST be approximately {max_output_length // 5} words (roughly {max_output_length} characters), excluding references. "
+        f"This is STRICT: the final body must be within ±10-15% of {max_output_length // 5} words "
+        f"(between {int((max_output_length // 5) * 0.85)} and {int((max_output_length // 5) * 1.15)} words). Do not produce output outside this range."
     ]
+
+    # Speaker perspective enforcement for speeches
+    if speaker_name:
+        system.insert(
+            -1,
+            f"SPEAKER PERSPECTIVE: This speech is delivered by {speaker_name}. "
+            "Write from the speaker's OWN first-person perspective ('I', 'we'). "
+            f"NEVER refer to {speaker_name} in the third person "
+            f"(e.g., WRONG: '{speaker_name} believes...'; RIGHT: 'I believe...').\n",
+        )
 
     if context_details:
         system.insert(
@@ -78,6 +93,4 @@ def rewrite_content(content_all, max_output_length, debug, context_details=""):
     if debug:
         st.write(messages)
     output = utils.chat(messages, 0.7)
-    if output:
-        return output[:max_output_length]
     return output

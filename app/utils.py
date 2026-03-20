@@ -8,6 +8,7 @@ import streamlit as st
 from datetime import datetime
 from openai import AzureOpenAI
 from azure.cosmos import CosmosClient, exceptions, PartitionKey
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from dotenv import load_dotenv
 import hashlib
 # from azure.identity import DefaultAzureCredential
@@ -87,6 +88,30 @@ styles_container = database.get_container_client("styles_from_speeches")
 outputs_container = database.get_container_client("outputs")
 style_writer_output_container = database.get_container_client("stylewriteroutput")
 style_refiner_output_container = database.get_container_client("stylerefineroutput")
+
+# --- Azure Blob Storage ---
+_blob_conn_str = os.getenv("APP_AZURE_STORAGE_CONNECTION_STRING", "")
+_blob_container_name = os.getenv("BUCKET_NAME", "co-outputs")
+
+def upload_bytes_to_blob(data: bytes, blob_name: str, content_type: str = "application/octet-stream") -> str:
+    """Upload bytes to Azure Blob Storage and return the public URL."""
+    try:
+        blob_service = BlobServiceClient.from_connection_string(_blob_conn_str)
+        container_client = blob_service.get_container_client(_blob_container_name)
+        try:
+            container_client.get_container_properties()
+        except Exception:
+            container_client.create_container()
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            data,
+            overwrite=True,
+            content_settings=ContentSettings(content_type=content_type),
+        )
+        return blob_client.url
+    except Exception as e:
+        print(f"[WARNING] Blob upload failed for {blob_name}: {e}")
+        return ""
 
 # log tracing
 def trace(col2, label, message):

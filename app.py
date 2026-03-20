@@ -263,7 +263,7 @@ st.text_area(
     key="context_details",
 )
 
-MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 40, 15_000, 1_000
+MIN_WORDS, MAX_WORDS, DEFAULT_WORDS = 40, 15_000, 500
 
 # One source of truth (word count)
 st.session_state.setdefault("max_words", DEFAULT_WORDS)
@@ -293,7 +293,7 @@ col_slider, col_input = st.columns([3, 1])
 
 with col_slider:
     st.slider(
-        ":blue[**Output Maximum Word Length ({MAX_WORDS:,} Maximum):**]",
+        ":blue[**Target Word Count:**]",
         min_value=MIN_WORDS,
         max_value=MAX_WORDS,
         key="max_words_slider",
@@ -312,7 +312,7 @@ with col_input:
     )
 
 # Convert word count to approximate character count for the pipeline (avg ~5 chars/word)
-max_output_length = st.session_state.max_words * 5
+target_output_length = st.session_state.max_words * 5
 
 # Extract text from uploaded files as attachments
 attachment_contents = []
@@ -858,6 +858,66 @@ with st.container(border=True):
                     help="Verify alignment with BSP communication policies")
 
 
+# --- Persistent Final Output (survives Streamlit reruns / download clicks) ---
+if "final_output_cache" in st.session_state:
+    import re as _re_persist
+    _cache = st.session_state["final_output_cache"]
+    _fo_text = _cache["text"]
+    _fo_label = _cache["label"]
+    _fo_docx = _cache["docx_bytes"]
+    _fo_pdf = _cache["pdf_bytes"]
+    _fo_base = _cache["base_name"]
+    _fo_speaker = _cache["speaker"]
+
+    st.markdown("---")
+    st.markdown("### 📝 Final Output")
+
+    # Split body and references for separate display
+    _ref_m = _re_persist.search(r'\n(?:=+\n)?\s*REFERENCES\s*\n(?:=+\n)?', _fo_text, flags=_re_persist.IGNORECASE)
+    if _ref_m:
+        _fo_body = _fo_text[:_ref_m.start()].rstrip()
+        _fo_refs = _fo_text[_ref_m.start():].strip()
+    else:
+        _fo_body = _fo_text
+        _fo_refs = ""
+
+    # Word count (excluding citations)
+    _body_stripped = _re_persist.sub(r'\((?=[^)]*\b(?:\d{4}[a-z]?|n\.d\.)\b)[^)]*\)', '', _fo_body, flags=_re_persist.IGNORECASE)
+    _body_stripped = _re_persist.sub(r'\[E\d+(?:,E\d+)*\]', '', _body_stripped)
+    _wc = len(_body_stripped.split())
+    _tw = int(st.session_state.get("max_words", 1000))
+    st.caption(f"Speech word count: **{_wc}** words (target: {_tw})")
+
+    st.text_area(_fo_label, _fo_body, height=420, key="final_output_display")
+
+    if _fo_refs:
+        with st.container(border=True):
+            st.markdown("#### 📚 References")
+            _clean = _re_persist.sub(r'^=+\n?', '', _fo_refs, flags=_re_persist.MULTILINE).strip()
+            _clean = _re_persist.sub(r'^\s*REFERENCES\s*$', '', _clean, flags=_re_persist.MULTILINE | _re_persist.IGNORECASE).strip()
+            st.text_area("References", _clean, height=200, key="final_refs_display")
+
+    _col_d, _col_p = st.columns(2)
+    with _col_d:
+        st.download_button(
+            "⬇️ Download DOCX",
+            data=_fo_docx,
+            file_name=f"{_fo_base}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            key="download_final_docx",
+        )
+    with _col_p:
+        st.download_button(
+            "⬇️ Download PDF",
+            data=_fo_pdf,
+            file_name=f"{_fo_base}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_final_pdf",
+        )
+
+
 if st.button(
     ":blue[**Generate Speech with Complete Pipeline**]",
     key="generate_speech",
@@ -1021,7 +1081,7 @@ if st.button(
         # Iterations are now selected automatically inside the writer pipeline
         selected_max_words = int(st.session_state.get("max_words", 1000))
         selected_max_words = max(MIN_WORDS, min(MAX_WORDS, selected_max_words))
-        selected_max_output_length = selected_max_words * 5  # convert words to approx characters
+        selected_target_output_length = selected_max_words * 5  # convert words to approx characters
         stage_store[1]["lines"].append("Configured iterations: auto (writer-selected)")
 
         def worker():
@@ -1208,7 +1268,7 @@ if st.button(
                         query=user_query,
                         sources=sources,
                         max_iterations=None,
-                        max_output_length=selected_max_output_length,
+                        target_output_length=selected_target_output_length,
                         context_details=context_details,
                         style=selected_style if selected_style else None,
                         enable_policy_check=7 in enabled_stages,
@@ -1374,10 +1434,7 @@ if st.button(
         st.session_state["pipeline_results"] = results
         st.success("Pipeline completed with responsive stage updates.")
 
-        st.markdown("---")
-        st.markdown("### 📝 Final Output")
-
-        # Prefer APA output, then styled output, then raw summary
+        # Extract final output text
         apa_result = results.get("styled_output_apa", {}) if isinstance(results, dict) else {}
         styled_result = results.get("styled_output", {}) if isinstance(results, dict) else {}
         final_summary = results.get("final_summary", {}) if isinstance(results, dict) else {}
@@ -1393,12 +1450,42 @@ if st.button(
             output_label = "Final Summary (Fallback)"
 
         if final_output_text:
-            st.text_area(
-                output_label,
-                final_output_text,
-                height=420,
-                key="final_output_display",
+            _speaker = st.session_state.get("selected_speaker_input", "Speaker")
+            _ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            _base_name = f"speech_{_speaker}_{_ts}"
+            _title = f"Speech - {_speaker}"
+
+            # Generate file bytes
+            _docx_bytes = make_docx_bytes(final_output_text, title=_title)
+            _pdf_bytes = make_pdf_bytes(final_output_text, title=_title)
+
+            # Upload to Azure Blob Storage
+            _pdf_url = utils.upload_bytes_to_blob(
+                _pdf_bytes,
+                f"speeches/{_base_name}.pdf",
+                content_type="application/pdf",
             )
+            _docx_url = utils.upload_bytes_to_blob(
+                _docx_bytes,
+                f"speeches/{_base_name}.docx",
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+            # Save to Cosmos DB with blob URLs
+            utils.save_style_writer_output(
+                final_output_text, user_query,
+                pdf_url=_pdf_url, docx_url=_docx_url,
+            )
+
+            # Cache in session state for persistent rendering across reruns
+            st.session_state["final_output_cache"] = {
+                "text": final_output_text,
+                "label": output_label,
+                "docx_bytes": _docx_bytes,
+                "pdf_bytes": _pdf_bytes,
+                "base_name": _base_name,
+                "speaker": _speaker,
+            }
         else:
             # Show detailed error info when no output is produced
             error_details = []
@@ -1420,37 +1507,7 @@ if st.button(
                 logger.warning("Pipeline produced no output and no error details for query '%s'",
                                user_query[:120] if user_query else "(empty)")
 
-        if final_output_text:
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            speaker = st.session_state.get("selected_speaker_input", "Speaker")
-            base_name = f"speech_{speaker}_{ts}"
-
-            col_docx, col_pdf = st.columns(2)
-            with col_docx:
-                docx_bytes = make_docx_bytes(final_output_text, title=f"Speech - {speaker}")
-                st.download_button(
-                    "⬇️ Download DOCX",
-                    data=docx_bytes,
-                    file_name=f"{base_name}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                    key="download_final_docx"
-                )
-            with col_pdf:
-                pdf_bytes = make_pdf_bytes(final_output_text, title=f"Speech - {speaker}")
-                st.download_button(
-                    "⬇️ Download PDF",
-                    data=pdf_bytes,
-                    file_name=f"{base_name}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key="download_final_pdf"
-                )
-
-            # Save style writer output to Cosmos DB
-            utils.save_style_writer_output(final_output_text, user_query)
-
-        st.stop()
+        st.rerun()
         
         # Create stage placeholders
         st.markdown("### 🔄 Writer Pipeline Running...")
