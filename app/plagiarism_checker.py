@@ -24,7 +24,7 @@ import asyncio
 # Import boilerplate detection
 from app.pipeline_enhancements import is_boilerplate
 
-# For embeddings
+# For embeddings (kept for backward compat; cross-encoder is preferred path)
 try:
     from openai import AsyncAzureOpenAI
 except ImportError:
@@ -35,6 +35,41 @@ try:
     from transformers import pipeline
 except ImportError:
     pipeline = None
+
+# ---------------------------------------------------------------------------
+# Cross-encoder singleton (lazy-loaded once per process, reused across calls)
+# ---------------------------------------------------------------------------
+_CROSS_ENCODER: Optional[Any] = None
+_CROSS_ENCODER_LOADED: bool = False
+
+
+def _load_cross_encoder() -> Optional[Any]:
+    """
+    Lazy-load a sentence-transformers CrossEncoder.
+
+    Model is configurable via env var PLAGIARISM_CROSS_ENCODER_MODEL.
+    Defaults to ms-marco-MiniLM-L-6-v2 (~85 MB, CPU-friendly, ~100 pairs/s).
+    Returns None gracefully if sentence-transformers is not installed.
+    """
+    global _CROSS_ENCODER, _CROSS_ENCODER_LOADED
+    if _CROSS_ENCODER_LOADED:
+        return _CROSS_ENCODER
+    model_name = os.getenv(
+        "PLAGIARISM_CROSS_ENCODER_MODEL",
+        "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    )
+    try:
+        from sentence_transformers import CrossEncoder as _CE
+        _CROSS_ENCODER = _CE(model_name, max_length=512)
+        print(f"  [CrossEncoder] Loaded: {model_name}")
+    except ImportError:
+        print("  [CrossEncoder] sentence-transformers not installed – falling back to Jaccard")
+        _CROSS_ENCODER = None
+    except Exception as e:  # pragma: no cover
+        print(f"  [CrossEncoder] Could not load '{model_name}': {e} – falling back to Jaccard")
+        _CROSS_ENCODER = None
+    _CROSS_ENCODER_LOADED = True
+    return _CROSS_ENCODER
 
 
 @dataclass
@@ -560,10 +595,9 @@ class PlagiarismChecker:
         chunk_analyses = await self._detect_matches(chunks, source_chunks)
         print(f"  Analyzed {len(chunk_analyses)} chunks")
         
-        # Step 5: Generate explanations via Azure OpenAI
+        # Step 5: Generate deterministic explanations (no LLM)
         print("\n[Step 5] Generating explanations...")
-        if self.azure_client:
-            chunk_analyses = await self._generate_explanations(chunk_analyses)
+        chunk_analyses = await self._generate_explanations(chunk_analyses)
         
         # Step 6: Aggregate results
         print("\n[Step 6] Aggregating results...")
@@ -791,114 +825,187 @@ class PlagiarismChecker:
         top_k: int = 5
     ) -> List[ChunkAnalysis]:
         """
-        Detect plagiarism matches for each speech chunk
-        
-        Two-stage:
-        1. Candidate retrieval (semantic similarity via embeddings)
-        2. Verification (lexical overlap)
+        Three-phase plagiarism matching pipeline (no Azure API calls):
+
+          Phase 1 — Jaccard pre-filter: quickly narrow each speech chunk's
+                    candidate pool to at most PLAGIARISM_CE_MAX_CANDIDATES
+                    sources using set-intersection Jaccard similarity.
+
+          Phase 2 — Cross-encoder batch reranking: a single model.predict()
+                    call across ALL pairs gives transformer-quality relevance
+                    scores without any network I/O.  Falls back to Jaccard
+                    ranking when sentence-transformers is not installed.
+
+          Phase 3 — Lexical verification: n-gram / Jaccard metrics on the
+                    top-k candidates, identical to the original logic.
         """
-        chunk_analyses = []
-        
-        # Get embeddings if Azure client available
-        embeddings_map = {}
-        if self.azure_client:
-            await self._compute_embeddings(speech_chunks, source_chunks, embeddings_map)
+        chunk_analyses: List[ChunkAnalysis] = []
+
+        # Config (all tunable via env vars)
+        try:
+            prefilter_threshold = float(os.getenv("PLAGIARISM_CE_PREFILTER_JACCARD", "0.05"))
+        except ValueError:
+            prefilter_threshold = 0.05
+        try:
+            prefilter_max = int(os.getenv("PLAGIARISM_CE_MAX_CANDIDATES", "15"))
+        except ValueError:
+            prefilter_max = 15
+
+        ce_model = _load_cross_encoder()
+
+        # ------------------------------------------------------------------ #
+        # Phase 1: Jaccard pre-filter — O(n_speech × n_source) set ops       #
+        # ------------------------------------------------------------------ #
+        print(
+            f"\n  Phase 1: Jaccard pre-filter "
+            f"({len(speech_chunks)} speech × {len(source_chunks)} source chunks)..."
+        )
+        chunk_candidates: List[tuple] = []  # (speech_chunk, [(src_dict, score)])
+
+        for speech_chunk in speech_chunks:
+            scored = []
+            for src in source_chunks:
+                j = SimilarityDetector.jaccard_similarity(
+                    speech_chunk.normalized_text,
+                    src['chunk'].normalized_text,
+                )
+                if j >= prefilter_threshold:
+                    scored.append((src, j))
+
+            # Hard cap before cross-encoding to bound O(pairs) cost
+            scored.sort(key=lambda x: x[1], reverse=True)
+            candidates = scored[:prefilter_max]
+
+            # Blind-spot guard: if nothing passes threshold, keep top-k by Jaccard
+            if not candidates and source_chunks:
+                fallback = sorted(
+                    source_chunks,
+                    key=lambda s: SimilarityDetector.jaccard_similarity(
+                        speech_chunk.normalized_text, s['chunk'].normalized_text
+                    ),
+                    reverse=True,
+                )[:top_k]
+                candidates = [
+                    (s, SimilarityDetector.jaccard_similarity(
+                        speech_chunk.normalized_text, s['chunk'].normalized_text
+                    ))
+                    for s in fallback
+                ]
+
+            chunk_candidates.append((speech_chunk, candidates))
+
+        total_pairs = sum(len(c) for _, c in chunk_candidates)
+        print(f"  Pre-filter: {total_pairs} candidate pairs across all chunks")
+
+        # ------------------------------------------------------------------ #
+        # Phase 2: Single-batch cross-encoder inference                       #
+        # All pairs submitted at once → maximum CPU/GPU batching efficiency   #
+        # ------------------------------------------------------------------ #
+        if ce_model and total_pairs > 0:
+            print(f"  Phase 2: Cross-encoding {total_pairs} pairs (single batch)...")
+
+            all_pairs: List[tuple] = []
+            pair_meta: List[tuple] = []  # (chunk_idx, candidate_idx)
+
+            for chunk_idx, (speech_chunk, candidates) in enumerate(chunk_candidates):
+                for cand_idx, (src, _) in enumerate(candidates):
+                    all_pairs.append((speech_chunk.text, src['chunk'].text))
+                    pair_meta.append((chunk_idx, cand_idx))
+
+            try:
+                raw_scores = ce_model.predict(all_pairs, show_progress_bar=False)
+                raw_scores = np.asarray(raw_scores, dtype=np.float32)
+                # Sigmoid maps raw logits → [0, 1] relevance probability
+                ce_probs = 1.0 / (1.0 + np.exp(-raw_scores))
+
+                # Distribute scores back to per-chunk candidate lists
+                chunk_ce_map: Dict[int, Dict[int, float]] = {}
+                for pair_idx, (chunk_idx, cand_idx) in enumerate(pair_meta):
+                    chunk_ce_map.setdefault(chunk_idx, {})[cand_idx] = float(ce_probs[pair_idx])
+
+                # Rebuild lists sorted by CE score, capped at top_k
+                for chunk_idx, (speech_chunk, candidates) in enumerate(chunk_candidates):
+                    if chunk_idx in chunk_ce_map:
+                        score_map = chunk_ce_map[chunk_idx]
+                        reranked = sorted(
+                            [(candidates[ci][0], score_map[ci]) for ci in range(len(candidates))],
+                            key=lambda x: x[1],
+                            reverse=True,
+                        )[:top_k]
+                        chunk_candidates[chunk_idx] = (speech_chunk, reranked)
+
+                print(f"  Cross-encoding complete ✓")
+            except Exception as ce_err:
+                print(f"  ⚠️ Cross-encoder failed ({ce_err}); falling back to Jaccard ranking")
+                for idx in range(len(chunk_candidates)):
+                    sc, cands = chunk_candidates[idx]
+                    chunk_candidates[idx] = (sc, cands[:top_k])
         else:
-            print(f"  No Azure client - using lexical similarity only")
-        
-        print(f"\n  Analyzing {len(speech_chunks)} speech chunks against {len(source_chunks)} source chunks...")
-        for chunk_idx, speech_chunk in enumerate(speech_chunks, 1):
-            print(f"\n  [{chunk_idx}/{len(speech_chunks)}] Analyzing chunk: {speech_chunk.chunk_id}")
-            print(f"      Words: {speech_chunk.word_count}, Text: '{speech_chunk.text[:50]}...'")
-            # Stage 1: Candidate retrieval
-            candidates = []
-            print(f"      Stage 1: Candidate retrieval...", end="", flush=True)
-            
-            if embeddings_map:
-                # Use semantic similarity
-                speech_emb = embeddings_map.get(speech_chunk.chunk_id)
-                if speech_emb is not None:
-                    for source_chunk in source_chunks:
-                        source_emb = embeddings_map.get(source_chunk['chunk'].chunk_id)
-                        if source_emb is not None:
-                            semantic_sim = SimilarityDetector.cosine_similarity(
-                                speech_emb, source_emb
-                            )
-                            if semantic_sim > 0.5:  # Threshold
-                                candidates.append((source_chunk, semantic_sim))
-            else:
-                # Fallback: use lexical similarity for candidate retrieval
-                for source_chunk in source_chunks:
-                    jaccard = SimilarityDetector.jaccard_similarity(
-                        speech_chunk.normalized_text,
-                        source_chunk['chunk'].normalized_text
-                    )
-                    if jaccard > 0.3:
-                        candidates.append((source_chunk, jaccard))
-            
-            # Sort by similarity and take top-k
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            candidates = candidates[:top_k]
-            print(f" found {len(candidates)} candidates")
-            
-            # Stage 2: Verification with lexical analysis
-            matches = []
-            if candidates:
-                print(f"      Stage 2: Verifying {len(candidates)} candidates...")
+            if not ce_model:
+                print("  Phase 2: Cross-encoder unavailable — using Jaccard ranking")
+            for idx in range(len(chunk_candidates)):
+                sc, cands = chunk_candidates[idx]
+                chunk_candidates[idx] = (sc, cands[:top_k])
+
+        # ------------------------------------------------------------------ #
+        # Phase 3: Lexical verification on top candidates                     #
+        # ------------------------------------------------------------------ #
+        print(f"\n  Phase 3: Lexical verification of top candidates...")
+        for chunk_idx, (speech_chunk, candidates) in enumerate(chunk_candidates):
+            print(
+                f"\n  [{chunk_idx + 1}/{len(chunk_candidates)}] {speech_chunk.chunk_id} "
+                f"({speech_chunk.word_count} words)  '{speech_chunk.text[:50]}...'"
+            )
+
+            matches: List[SourceMatch] = []
             for cand_idx, (source_chunk, semantic_sim) in enumerate(candidates, 1):
-                # Compute lexical metrics
                 lex_metrics = SimilarityDetector.lexical_similarity(
                     speech_chunk.normalized_text,
-                    source_chunk['chunk'].normalized_text
+                    source_chunk['chunk'].normalized_text,
                 )
-                
-                # Overall lexical score (weighted average)
                 lexical_sim = (
-                    lex_metrics['jaccard'] * 0.3 +
-                    lex_metrics['trigram_overlap'] * 0.4 +
-                    lex_metrics['fivegram_overlap'] * 0.3
+                    lex_metrics['jaccard'] * 0.3
+                    + lex_metrics['trigram_overlap'] * 0.4
+                    + lex_metrics['fivegram_overlap'] * 0.3
                 )
                 containment = lex_metrics['containment_3gram']
-                
-                # Classify match type
+
                 match_type = PlagiarismClassifier.classify_match(
                     semantic_sim, lexical_sim, containment
                 )
-                
-                print(f"        Candidate {cand_idx}: Semantic={semantic_sim:.3f}, Lexical={lexical_sim:.3f}, Type={match_type}")
-                
-                # Create match object
-                match = SourceMatch(
+                print(
+                    f"      Cand {cand_idx}: Semantic={semantic_sim:.3f}, "
+                    f"Lexical={lexical_sim:.3f}, Type={match_type}"
+                )
+
+                matches.append(SourceMatch(
                     source_url=source_chunk['source_url'],
                     source_title=source_chunk['source_title'],
                     source_date=source_chunk.get('source_date'),
-                    source_speaker=None,  # Could extract if available
+                    source_speaker=None,
                     source_chunk=source_chunk['chunk'].text,
                     similarity_semantic=semantic_sim,
                     similarity_lexical=lexical_sim,
                     overlap_ratio=containment,
                     match_type=match_type,
                     classification_label=source_chunk.get('classification'),
-                    evidence_snippets=[]  # Could extract matching n-grams
-                )
-                matches.append(match)
-            
-            # IMPROVEMENT #5: Use already-set boilerplate flag from chunking
-            is_boilerplate = speech_chunk.is_boilerplate
-            
+                    evidence_snippets=[],
+                ))
+
+            is_boilerplate_chunk = speech_chunk.is_boilerplate
+
             if matches:
-                best_match = matches[0]
+                best = matches[0]
                 risk_score = PlagiarismClassifier.compute_risk_score(
-                    match_type=best_match.match_type,
-                    semantic_sim=best_match.similarity_semantic,
-                    lexical_sim=best_match.similarity_lexical,
+                    match_type=best.match_type,
+                    semantic_sim=best.similarity_semantic,
+                    lexical_sim=best.similarity_lexical,
                     chunk_length=speech_chunk.word_count,
-                    is_boilerplate=is_boilerplate
+                    is_boilerplate=is_boilerplate_chunk,
                 )
             else:
                 risk_score = 0.0
-            
-            # Determine risk level
+
             if risk_score > 0.7:
                 risk_level = "high"
             elif risk_score > 0.4:
@@ -907,136 +1014,63 @@ class PlagiarismChecker:
                 risk_level = "low"
             else:
                 risk_level = "none"
-            
-            print(f"      Risk: {risk_level.upper()} (score={risk_score:.3f}){' [BOILERPLATE]' if is_boilerplate else ''}")
-            
-            # Create analysis
-            analysis = ChunkAnalysis(
+
+            print(
+                f"      Risk: {risk_level.upper()} (score={risk_score:.3f})"
+                f"{' [BOILERPLATE]' if is_boilerplate_chunk else ''}"
+            )
+
+            chunk_analyses.append(ChunkAnalysis(
                 chunk=speech_chunk,
                 top_matches=matches,
                 risk_score=risk_score,
                 risk_level=risk_level,
-                is_boilerplate=is_boilerplate,
-                explanation=""  # Will be filled by LLM
-            )
-            chunk_analyses.append(analysis)
-        
+                is_boilerplate=is_boilerplate_chunk,
+                explanation="",  # Filled by _generate_explanations (deterministic)
+            ))
+
         return chunk_analyses
-    
+
     async def _compute_embeddings(
         self,
         speech_chunks: List[SpeechChunk],
         source_chunks: List[Dict[str, Any]],
         embeddings_map: Dict[str, np.ndarray]
     ):
-        """Compute embeddings for all chunks using Azure OpenAI"""
-        if not self.azure_client:
-            return
-        
-        # Filter out boilerplate chunks to save computation
-        content_speech_chunks = [c for c in speech_chunks if not c.is_boilerplate]
-        boilerplate_count = len(speech_chunks) - len(content_speech_chunks)
-        
-        print(f"  Computing embeddings for {len(content_speech_chunks)} speech chunks (skipped {boilerplate_count} boilerplate) + {len(source_chunks)} source chunks...")
-        
-        # Collect all texts
-        texts_to_embed = []
-        ids = []
-        
-        for chunk in content_speech_chunks:
-            texts_to_embed.append(chunk.text)
-            ids.append(chunk.chunk_id)
-        
-        for source_chunk in source_chunks:
-            texts_to_embed.append(source_chunk['chunk'].text)
-            ids.append(source_chunk['chunk'].chunk_id)
-        
-        # Batch embed (Azure supports up to 16 at a time for text-embedding-3-small)
-        batch_size = 16
-        total_batches = (len(texts_to_embed) + batch_size - 1) // batch_size
-        print(f"  Processing {total_batches} embedding batches...")
-        
-        for i in range(0, len(texts_to_embed), batch_size):
-            batch_texts = texts_to_embed[i:i+batch_size]
-            batch_ids = ids[i:i+batch_size]
-            batch_num = i // batch_size + 1
-            
-            try:
-                print(f"    Batch {batch_num}/{total_batches}: Embedding {len(batch_texts)} chunks...", end="", flush=True)
-                response = await self.azure_client.embeddings.create(
-                    input=batch_texts,
-                    model="text-embedding-3-small"
-                )
-                
-                for j, embedding_obj in enumerate(response.data):
-                    embeddings_map[batch_ids[j]] = np.array(embedding_obj.embedding)
-                print(" ✓")
-            
-            except Exception as e:
-                print(f" ✗")
-                print(f"      ⚠️ Batch failed: {str(e)[:60]}")
+        """Kept for backward compatibility. Not called by the main pipeline —
+        cross-encoder reranking is used instead (see _detect_matches)."""
+        pass
     
     async def _generate_explanations(
         self,
         chunk_analyses: List[ChunkAnalysis]
     ) -> List[ChunkAnalysis]:
-        """Generate human-readable explanations using Azure OpenAI"""
-        # Only explain chunks with medium/high risk
-        flagged_chunks = [a for a in chunk_analyses if a.risk_level in ["medium", "high"]]
-        if flagged_chunks:
-            print(f"  Generating explanations for {len(flagged_chunks)} flagged chunks...")
-        
-        for idx, analysis in enumerate(chunk_analyses, 1):
-            if analysis.risk_level in ["medium", "high"] and analysis.top_matches:
-                best_match = analysis.top_matches[0]
-                
-                prompt = f"""Analyze this potential plagiarism match:
+        """
+        Build deterministic, template-based explanations for flagged chunks.
+        No LLM call — scores and match type from the cross-encoder pipeline
+        carry enough information to produce a useful, actionable description.
+        """
+        _match_type_prose = {
+            "direct_quote": "appears to be a direct quote or near-verbatim copy",
+            "close_paraphrase": "appears to be a close paraphrase with synonym substitution",
+            "common_phrase": "shares common phrasing that may be standard in the domain",
+            "unique": "is likely coincidental or uses domain-standard language",
+        }
+        flagged = [a for a in chunk_analyses if a.risk_level in ("medium", "high")]
+        print(f"  Generating deterministic explanations for {len(flagged)} flagged chunks...")
 
-SUSPECT TEXT:
-{analysis.chunk.text}
+        for analysis in chunk_analyses:
+            if analysis.risk_level not in ("medium", "high") or not analysis.top_matches:
+                continue
+            best = analysis.top_matches[0]
+            prose = _match_type_prose.get(best.match_type, "shows notable overlap")
+            analysis.explanation = (
+                f"This {analysis.risk_level}-risk segment {prose} with content from "
+                f"'{best.source_title}' "
+                f"(semantic={best.similarity_semantic:.2f}, lexical={best.similarity_lexical:.2f}). "
+                f"Recommend manual review."
+            )
 
-MATCHED SOURCE:
-Title: {best_match.source_title}
-URL: {best_match.source_url}
-Text: {best_match.source_chunk}
-
-SIMILARITY SCORES:
-- Semantic: {best_match.similarity_semantic:.2f}
-- Lexical: {best_match.similarity_lexical:.2f}
-- Match type: {best_match.match_type}
-
-Provide a brief 1-2 sentence explanation of the similarity and whether it appears to be:
-1. Direct copying
-2. Paraphrasing  
-3. Common phrasing (acceptable overlap)
-4. Coincidental similarity
-"""
-                
-                try:
-                    print(f"    Chunk {idx}: Generating explanation...", end="", flush=True)
-                    explanation_model = (
-                        os.getenv("AZURE_OPENAI_STAGE6_EXPLANATION_DEPLOYMENT")
-                        or os.getenv("AZURE_OPENAI_CHAT_MINI_DEPLOYMENT")
-                        or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
-                        or "gpt-4o"
-                    )
-                    response = await self.azure_client.chat.completions.create(
-                        model=explanation_model,
-                        messages=[
-                            {"role": "system", "content": "You are an expert in plagiarism detection and academic integrity."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        temperature=0.3,
-                        max_tokens=200
-                    )
-                    
-                    analysis.explanation = response.choices[0].message.content.strip()
-                    print(" ✓")
-                
-                except Exception as e:
-                    analysis.explanation = f"Could not generate explanation: {e}"
-                    print(f" ✗")
-        
         return chunk_analyses
     
     def _aggregate_results(

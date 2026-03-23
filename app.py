@@ -860,6 +860,8 @@ with st.container(border=True):
                     help="Verify alignment with BSP communication policies")
 
 
+
+
 # --- Persistent Final Output (survives Streamlit reruns / download clicks) ---
 if "final_output_cache" in st.session_state:
     import re as _re_persist
@@ -1276,6 +1278,7 @@ if st.button(
                         enable_policy_check=7 in enabled_stages,
                         enabled_stages=enabled_stages,
                         progress_callback=lambda event: event_queue.put(event),
+                        use_deep_research=True,
                     )
                 )
                 builtins.print = original_print
@@ -1894,6 +1897,7 @@ if st.button(
                     style=selected_style if selected_style else None,
                     enable_policy_check=7 in enabled_stages,
                     enabled_stages=enabled_stages,
+                    use_deep_research=True,
                 )
             )
             
