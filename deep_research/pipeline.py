@@ -5,7 +5,22 @@ from typing import Callable, Awaitable, Optional, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
 from tavily import AsyncTavilyClient
-from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
+
+# langchain_azure_ai has shipped multiple Azure chat model wrappers over time.
+# Keep this import compatible across versions.
+try:
+    # Older versions (name used in this repo historically)
+    from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel as AzureChatModel  # type: ignore
+    _AZURE_CHAT_MODEL_FLAVOR = "azure_openai_api"
+except ImportError:  # pragma: no cover
+    try:
+        # Current versions in this environment
+        from langchain_azure_ai.chat_models import AzureAIChatCompletionsModel as AzureChatModel  # type: ignore
+        _AZURE_CHAT_MODEL_FLAVOR = "azure_ai_chat_completions"
+    except ImportError:  # pragma: no cover
+        # Last-resort fallback
+        from langchain_azure_ai.chat_models import AzureChatOpenAI as AzureChatModel  # type: ignore
+        _AZURE_CHAT_MODEL_FLAVOR = "azure_chat_openai"
 
 # --- keep your existing helpers imports ---
 from .prompts import (query_writer_instructions, summarizer_instructions,
@@ -15,7 +30,7 @@ from .states import SummaryState, SummaryStateInput, SummaryStateOutput
 
 # Model initialization - lazy loaded to avoid import-time connection
 # Cache is loop-scoped so async clients are not reused across different event loops.
-_deep_research_models: Dict[str, AzureAIOpenAIApiChatModel] = {}
+_deep_research_models: Dict[str, Any] = {}
 
 
 def _current_loop_cache_scope() -> str:
@@ -41,7 +56,7 @@ def _get_model(task_tier: str = "light"):
     Validates environment variables and initializes model on first use.
     
     Returns:
-        AzureAIOpenAIApiChatModel: Initialized model instance
+        Initialized Azure chat model instance
         
     Raises:
         ValueError: If required environment variables are missing
@@ -74,12 +89,27 @@ def _get_model(task_tier: str = "light"):
         )
     
     # Initialize model
-    # Note: Use 'model' parameter, NOT 'model_name' for Azure AI Inference compatibility
-    model_instance = AzureAIOpenAIApiChatModel(
-        base_url=_endpoint,
-        api_key=_key,
-        model=_model_name,
-    )
+    # Note: Azure AI Inference uses endpoint+credential; older wrappers used base_url+api_key.
+    if _AZURE_CHAT_MODEL_FLAVOR == "azure_ai_chat_completions":
+        model_instance = AzureChatModel(
+            endpoint=_endpoint,
+            credential=_key,
+            model=_model_name,
+        )
+    elif _AZURE_CHAT_MODEL_FLAVOR == "azure_openai_api":
+        model_instance = AzureChatModel(
+            base_url=_endpoint,
+            api_key=_key,
+            model=_model_name,
+        )
+    else:
+        # AzureChatOpenAI supports both OpenAI-style and Azure-style params. We prefer base_url here
+        # because this repo uses AZURE_INFERENCE_ENDPOINT (not the standard azure_endpoint).
+        model_instance = AzureChatModel(
+            base_url=_endpoint,
+            api_key=_key,
+            model=_model_name,
+        )
 
     _deep_research_models[model_key] = model_instance
     return model_instance

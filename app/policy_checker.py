@@ -1,8 +1,10 @@
 """
-BSP Policy Alignment Checker using Azure AI Agent
+BSP Policy Alignment Checker — dual-backend
 
-This module interfaces with a specialized Azure AI Agent that has been trained
-on BSP memorandum circulars and policy guidelines to verify speech compliance.
+Preferred backend : Function App 5-signal RRF (fast, X-API-Key auth)
+                    Set POLICY_FUNCTION_APP_URL + POLICY_FUNCTION_APP_KEY
+Fallback backend  : Azure AI Agent (MSAL thread-polling)
+                    Set the six AZURE_POLICY_* / AZURE_CLIENT_* env vars
 """
 import os
 import json
@@ -442,51 +444,225 @@ Please conduct a thorough policy alignment review checking:
 Please provide your comprehensive assessment with specific violations, circular references, and actionable recommendations."""
 
 
+# ---------------------------------------------------------------------------
+# Compiled regex for extracting BSP circular references from free text
+# ---------------------------------------------------------------------------
+_CIRCULAR_RE = re.compile(
+    r'(?:Circular\s+(?:No\.?\s*)?|M-)(\d{4}-\d{3}|\d{3,4})',
+    re.IGNORECASE,
+)
+
+
+class FunctionAppPolicyClient:
+    """
+    Fast retrieval client for the BSP Function App 5-signal RRF endpoint.
+
+    Preferred backend: stateless HTTP POST to /api/search with X-API-Key auth.
+    Runs 5 RRF signals (full-text + vector) inside Cosmos DB — sub-second
+    latency with no thread-polling overhead.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        agent_id: str,
+        timeout: int = 45,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.agent_id = agent_id
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        try:
+            self._top_k = int(os.getenv("POLICY_FUNCTION_TOP_K", "20"))
+        except ValueError:
+            self._top_k = 20
+        try:
+            self._top_results = int(os.getenv("POLICY_FUNCTION_TOP_RESULTS", "12"))
+        except ValueError:
+            self._top_results = 12
+
+    @staticmethod
+    def _extract_entities(text: str) -> List[str]:
+        """Extract BSP circular refs + ALL-CAPS acronyms from text (cap 10)."""
+        entities: List[str] = []
+        for m in _CIRCULAR_RE.finditer(text):
+            ref = m.group(0).strip()
+            if ref not in entities:
+                entities.append(ref)
+        for m in re.finditer(r'\b[A-Z]{2,8}\b', text):
+            word = m.group(0)
+            if word not in entities:
+                entities.append(word)
+        return entities[:10]
+
+    @staticmethod
+    def _normalize_chunk(chunk: Dict[str, Any]) -> Dict[str, Any]:
+        """Map Function App response fields to the standard snippet schema."""
+        content = chunk.get("chunkContent") or ""
+        fname = chunk.get("fileName") or ""
+        topic = chunk.get("topic") or ""
+        key_phrases = chunk.get("keyPhrases") or []
+
+        # Try to pull circular reference from the entities list first
+        entities_raw = chunk.get("entities") or []
+        circ_ref = None
+        if isinstance(entities_raw, list):
+            for ent in entities_raw:
+                if _CIRCULAR_RE.search(str(ent)):
+                    circ_ref = str(ent).strip()
+                    break
+        if not circ_ref:
+            m = _CIRCULAR_RE.search(fname) or _CIRCULAR_RE.search(content)
+            if m:
+                circ_ref = m.group(0).strip()
+        if not circ_ref:
+            circ_ref = fname or "BSP policy document"
+
+        # Build a human-readable relevance_reason from available metadata
+        if topic and key_phrases:
+            kp_str = ", ".join(str(k) for k in key_phrases[:4])
+            relevance_reason = f"Covers '{topic}' with key concepts: {kp_str}"
+        elif topic:
+            relevance_reason = f"Relevant to topic: {topic}"
+        elif key_phrases:
+            kp_str = ", ".join(str(k) for k in key_phrases[:5])
+            relevance_reason = f"Key policy concepts: {kp_str}"
+        else:
+            relevance_reason = "Retrieved via 5-signal RRF policy search"
+
+        return {
+            "circular_reference": circ_ref,
+            "policy_area": topic or "BSP Policy",
+            "excerpt": content[:600],
+            "relevance_reason": relevance_reason,
+            "source_file": fname,
+            "vector_score": chunk.get("vectorScore"),
+        }
+
+    async def retrieve_policy_snippets(
+        self,
+        segment_text: str,
+        speech_metadata: Dict[str, Any],
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Query /api/search on the Function App and return normalized snippets."""
+        url = f"{self.base_url}/api/search"
+        entities = self._extract_entities(segment_text)
+        payload: Dict[str, Any] = {
+            "queries": [segment_text[:1000]],
+            "entities": entities,
+            "topK": self._top_k,
+            "topResults": self._top_results,
+            "enableLLMFilter": False,
+        }
+        if self.agent_id:
+            payload["agentId"] = self.agent_id
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": self.api_key,
+        }
+
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise Exception(
+                        f"Function App /api/search returned {resp.status}: {body[:300]}"
+                    )
+                data = await resp.json()
+
+        # Unwrap: endpoint may return a list or a wrapper dict
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = (
+                data.get("results")
+                or data.get("value")
+                or data.get("chunks")
+                or []
+            )
+        else:
+            items = []
+
+        normalized = [self._normalize_chunk(c) for c in items]
+        return normalized[:top_k]
+
+
 class PolicyChecker:
     """
-    High-level policy checker using Azure AI Agent
-    Uses Azure AD authentication for secure access to the agent.
+    High-level policy checker — dual-backend.
+
+    Preferred : Function App 5-signal RRF
+                (POLICY_FUNCTION_APP_URL + POLICY_FUNCTION_APP_KEY)
+    Fallback  : Azure AI Agent MSAL thread-polling
+                (all six AZURE_POLICY_* / AZURE_CLIENT_* vars required)
     """
-    
+
     def __init__(self):
-        self.endpoint = os.getenv("AZURE_POLICY_ENDPOINT")
-        self.agent_id = os.getenv("AZURE_POLICY_AGENT_ID")
-        self.deployment = os.getenv("AZURE_POLICY_DEPLOYMENT")
-        self.client_id = os.getenv("AZURE_CLIENT_ID")
-        self.tenant_id = os.getenv("AZURE_TENANT_ID")
-        self.client_secret = os.getenv("AZURE_CLIENT_SECRET")
-        self.api_version = os.getenv("AZURE_POLICY_API_VERSION", "v1")  # Default to v1
-        
-        # Validate required credentials
-        missing = []
-        if not self.endpoint:
-            missing.append("AZURE_POLICY_ENDPOINT")
-        if not self.agent_id:
-            missing.append("AZURE_POLICY_AGENT_ID")
-        if not self.deployment:
-            missing.append("AZURE_POLICY_DEPLOYMENT")
-        if not self.client_id:
-            missing.append("AZURE_CLIENT_ID")
-        if not self.tenant_id:
-            missing.append("AZURE_TENANT_ID")
-        if not self.client_secret:
-            missing.append("AZURE_CLIENT_SECRET")
-        
-        if missing:
-            raise ValueError(
-                f"Missing Azure Policy Agent credentials: {', '.join(missing)}. "
-                "Set these in .env file."
+        fa_url = os.getenv("POLICY_FUNCTION_APP_URL", "").strip()
+        fa_key = os.getenv("POLICY_FUNCTION_APP_KEY", "").strip()
+        fa_agent_id = os.getenv("POLICY_FUNCTION_AGENT_ID", "").strip()
+        try:
+            fa_timeout = int(os.getenv("POLICY_FUNCTION_TIMEOUT", "45"))
+        except ValueError:
+            fa_timeout = 45
+
+        if fa_url and fa_key:
+            print(f"  🚀 Policy backend: Function App ({fa_url[:60]}...)")
+            self.client = FunctionAppPolicyClient(
+                base_url=fa_url,
+                api_key=fa_key,
+                agent_id=fa_agent_id,
+                timeout=fa_timeout,
             )
-        
-        self.client = AzurePolicyAgentClient(
-            endpoint=self.endpoint,
-            agent_id=self.agent_id,
-            deployment=self.deployment,
-            client_id=self.client_id,
-            tenant_id=self.tenant_id,
-            client_secret=self.client_secret,
-            api_version=self.api_version
-        )
+            self._backend = "function_app"
+            # Not used by the systematic retrieval path
+            self.endpoint = None
+            self.agent_id = fa_agent_id
+            self.deployment = None
+        else:
+            # Azure AI Agent fallback (MSAL-based)
+            self.endpoint = os.getenv("AZURE_POLICY_ENDPOINT")
+            self.agent_id = os.getenv("AZURE_POLICY_AGENT_ID")
+            self.deployment = os.getenv("AZURE_POLICY_DEPLOYMENT")
+            self.client_id = os.getenv("AZURE_CLIENT_ID")
+            self.tenant_id = os.getenv("AZURE_TENANT_ID")
+            self.client_secret = os.getenv("AZURE_CLIENT_SECRET")
+            self.api_version = os.getenv("AZURE_POLICY_API_VERSION", "v1")
+
+            missing = []
+            if not self.endpoint:
+                missing.append("AZURE_POLICY_ENDPOINT")
+            if not self.agent_id:
+                missing.append("AZURE_POLICY_AGENT_ID")
+            if not self.deployment:
+                missing.append("AZURE_POLICY_DEPLOYMENT")
+            if not self.client_id:
+                missing.append("AZURE_CLIENT_ID")
+            if not self.tenant_id:
+                missing.append("AZURE_TENANT_ID")
+            if not self.client_secret:
+                missing.append("AZURE_CLIENT_SECRET")
+
+            if missing:
+                raise ValueError(
+                    f"Missing policy backend config. Set POLICY_FUNCTION_APP_URL + "
+                    f"POLICY_FUNCTION_APP_KEY for the Function App backend, or provide "
+                    f"these Azure AI Agent credentials: {', '.join(missing)}"
+                )
+
+            print(f"  🏛️ Policy backend: Azure AI Agent ({self.agent_id})")
+            self.client = AzurePolicyAgentClient(
+                endpoint=self.endpoint,
+                agent_id=self.agent_id,
+                deployment=self.deployment,
+                client_id=self.client_id,
+                tenant_id=self.tenant_id,
+                client_secret=self.client_secret,
+                api_version=self.api_version,
+            )
+            self._backend = "azure_ai_agent"
     
     async def check_policy_alignment(
         self,
