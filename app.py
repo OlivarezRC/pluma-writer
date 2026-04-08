@@ -960,9 +960,19 @@ if "final_output_cache" in st.session_state:
             )
 
 
+def _clear_output_cache():
+    """on_click callback — runs before the next rerun so the output block never sees stale data."""
+    st.session_state.pop("final_output_cache", None)
+    st.session_state.pop("pipeline_results", None)
+    # Clear old keywords so deep research uses the new speech topic, not leftover keywords
+    # from a previous run on a different subject.
+    st.session_state.pop("research_topics", None)
+
+
 if st.button(
     ":blue[**Generate Speech with Complete Pipeline**]",
     key="generate_speech",
+    on_click=_clear_output_cache,
     disabled=(
         not st.session_state.get("research_query", "").strip()
     ),
@@ -974,7 +984,7 @@ if st.button(
     import sys
     from io import StringIO
     import re
-    
+
     with st.container(border=True):
         # Prepare sources dictionary
         user_query = st.session_state.get("research_query", "")

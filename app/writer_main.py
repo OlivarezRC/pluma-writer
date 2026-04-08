@@ -75,6 +75,20 @@ _STAGE1_CACHE: Dict[str, Dict[str, Any]] = {
 }
 
 
+def clear_run_caches() -> None:
+    """Clear all in-memory per-run caches so each generation starts fresh.
+    Does NOT clear _STYLE_DIGEST_CACHE (compiled style data, never stale).
+    """
+    global _STAGE1_CACHE, _POLICY_CHECK_CACHE, _link_processing_models
+    _STAGE1_CACHE["topic"].clear()
+    _STAGE1_CACHE["links"].clear()
+    _STAGE1_CACHE["attachments"].clear()
+    _STAGE1_CACHE.pop("policy", None)
+    _POLICY_CHECK_CACHE.clear()
+    _link_processing_models.clear()
+    print("[CACHE] Per-run caches cleared for new generation.")
+
+
 def _is_stage1_cache_enabled() -> bool:
     return os.getenv("WRITER_STAGE1_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3688,8 +3702,8 @@ async def generate_styled_output(
             "7. End with a short closing reflection (1-3 sentences) on why this topic matters to BSP, financial institutions, and the nation as a whole. Keep this aligned with available evidence and avoid unsupported claims.\n",
             "8. Finish with a clear closing greeting line (e.g., 'Thank you.' or 'Maraming salamat po.').\n\n",
             f"TARGET OUTPUT LENGTH: {max_output_length} characters — approximately {max_output_length // 5} words (excluding references). "
-            f"This is a STRICT target: the final speech body MUST be within ±10-15% of {max_output_length // 5} words. "
-            f"That means between {int((max_output_length // 5) * 0.85)} and {int((max_output_length // 5) * 1.15)} words. Do NOT produce output significantly outside this range."
+            f"This is a STRICT target: the final speech body MUST be within ±5% of {max_output_length // 5} words. "
+            f"That means between {int((max_output_length // 5) * 0.95)} and {int((max_output_length // 5) * 1.05)} words. Do NOT produce output significantly outside this range."
         ])
         
         system_prompt = "".join(system_parts)
@@ -3816,15 +3830,15 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 "token_usage": token_usage_summary,
             }
         
-        # Enforce strict target word count: trim or expand to stay within ±15% of target.
+        # Enforce strict target word count: trim or expand to stay within ±5% of target.
         body_text, references_section = split_references_section(styled_output)
         body_length = len(body_text)
         effective_body_length = len(strip_in_text_citations(body_text))
-        upper_tolerance = int(max_output_length * 1.15)  # allow up to 15% over
-        lower_bound = int(max_output_length * 0.85)  # enforce if under 15%
+        upper_tolerance = int(max_output_length * 1.05)  # allow up to 5% over
+        lower_bound = int(max_output_length * 0.95)  # enforce if under 5%
         target_words = max_output_length // 5
         effective_words = len(strip_in_text_citations(body_text).split())
-        print(f"[INFO] Word count check: {effective_words} words (target: {target_words}, range: {int(target_words * 0.85)}-{int(target_words * 1.15)})")
+        print(f"[INFO] Word count check: {effective_words} words (target: {target_words}, range: {int(target_words * 0.95)}-{int(target_words * 1.05)})")
         if effective_body_length > upper_tolerance:
             pct_over = ((effective_body_length - max_output_length) / max_output_length) * 100
             print(f"[INFO] Output body exceeds target by {pct_over:.0f}% ({body_length} raw chars, {effective_body_length} effective chars vs {max_output_length} target). Trimming deterministically...")
@@ -3862,7 +3876,7 @@ Now rewrite the summary in the specified style with ALL citations preserved:"""
                 )
                 _accumulate_usage(exp_response)
                 expanded_body = exp_response.choices[0].message.content
-                if expanded_body and len(strip_in_text_citations(expanded_body).split()) >= int(target_words * 0.8):
+                if expanded_body and len(strip_in_text_citations(expanded_body).split()) >= int(target_words * 0.95):
                     expanded_words = len(strip_in_text_citations(expanded_body).split())
                     print(f"[INFO] Expansion successful: {expanded_words} words (target: {target_words})")
                     # Trim if the expansion itself overshoots
@@ -4798,6 +4812,17 @@ async def speechify_output(
         word_count = len(speech_text.split())
         print(f"[SPEECHIFY] ✓ Composed {word_count}-word speech")
 
+        # Enforce ±5% word count tolerance
+        upper_word_limit = int(target_word_count * 1.05)
+        lower_word_limit = int(target_word_count * 0.95)
+        if word_count > upper_word_limit:
+            print(f"[SPEECHIFY] Word count {word_count} exceeds +5% tolerance (max: {upper_word_limit}), trimming...")
+            speech_text = trim_body_preserve_closing(speech_text, target_word_count * 5)
+            word_count = len(speech_text.split())
+            print(f"[SPEECHIFY] After trim: {word_count} words")
+        elif word_count < lower_word_limit:
+            print(f"[SPEECHIFY] Word count {word_count} is below -5% tolerance (min: {lower_word_limit})")
+
         return {
             "success": True,
             "speech": speech_text,
@@ -4847,6 +4872,9 @@ async def process_with_iterative_refinement_and_style(
     Returns:
         Complete results including refined summary, styled output, and policy check
     """
+    # Clear per-run in-memory caches so each generation starts fresh
+    clear_run_caches()
+
     # Propagate use_deep_research to env so topic_processing can see it
     if not use_deep_research:
         os.environ["ENABLE_DEEP_RESEARCH"] = "false"

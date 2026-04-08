@@ -64,7 +64,7 @@ def rewrite_content(content_all, max_output_length, debug, context_details=""):
         f"<writingExample>{digest.get('example', '')}</writingExample>\n",
         "Make sure to emulate the writing style, global rules, guidelines and example provided above.",
         f"TARGET WORD COUNT: Your output MUST be approximately {max_output_length // 5} words (roughly {max_output_length} characters), excluding references. "
-        f"This is STRICT: the final body must be within ±10-15% of {max_output_length // 5} words "
+        f"This is STRICT: the final body must be within ±5% of {max_output_length // 5} words "
         f"(between {int((max_output_length // 5) * 0.85)} and {int((max_output_length // 5) * 1.15)} words). Do not produce output outside this range."
     ]
 
